@@ -33,9 +33,10 @@ pub struct ServerResult {
 }
 
 /// Where the server should silently drop the connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClosePoint {
     /// Complete the full conversation normally.
+    #[default]
     Normal,
     /// Close immediately after sending the `354` response.
     BeforeData,
@@ -46,12 +47,6 @@ pub enum ClosePoint {
     AfterFinalDot,
     /// Close after sending the final `250` response.
     AfterDataReply,
-}
-
-impl Default for ClosePoint {
-    fn default() -> Self {
-        ClosePoint::Normal
-    }
 }
 
 /// Configuration for the fake smarthost's reply behaviour.
