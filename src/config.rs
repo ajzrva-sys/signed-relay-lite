@@ -39,7 +39,8 @@ pub enum RelayTls {
 pub struct Secret(Vec<u8>);
 
 impl Secret {
-    fn new(bytes: Vec<u8>) -> Self {
+    /// Take ownership of secret bytes so they can be erased on drop.
+    pub fn new(bytes: Vec<u8>) -> Self {
         Self(bytes)
     }
 

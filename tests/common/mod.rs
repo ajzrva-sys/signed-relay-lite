@@ -174,6 +174,8 @@ pub struct SmarthostConfig {
     pub greeting: Vec<u8>,
     /// Reply to the `EHLO` command.
     pub ehlo_response: Vec<u8>,
+    /// Reply to the `AUTH PLAIN` command.
+    pub auth_response: Vec<u8>,
     /// Reply to the `MAIL FROM` command.
     pub mail_from_response: Vec<u8>,
     /// Per-recipient `RCPT TO` replies.  When exhausted the default is
@@ -192,6 +194,7 @@ impl Default for SmarthostConfig {
         Self {
             greeting: b"220 localhost ready\r\n".to_vec(),
             ehlo_response: b"250-localhost\r\n250 OK\r\n".to_vec(),
+            auth_response: b"235 Authentication successful\r\n".to_vec(),
             mail_from_response: b"250 OK\r\n".to_vec(),
             rcpt_responses: Vec::new(),
             data_go_ahead: b"354 Go ahead\r\n".to_vec(),
@@ -241,25 +244,30 @@ impl FakeSmarthost {
 
     /// Start a one-connection implicit-TLS smarthost.
     pub fn start_tls(config: SmarthostConfig, acceptor: SslAcceptor) -> Self {
+        Self::start_tls_connections(vec![config], acceptor)
+    }
+
+    /// Start an implicit-TLS server with one script per connection.
+    pub fn start_tls_connections(configs: Vec<SmarthostConfig>, acceptor: SslAcceptor) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind failed");
         let addr = listener.local_addr().expect("local_addr failed");
         let handle = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept failed");
-            stream
-                .set_read_timeout(Some(TEST_TIMEOUT))
-                .expect("read timeout");
-            stream
-                .set_write_timeout(Some(TEST_TIMEOUT))
-                .expect("write timeout");
-            let mut result = ServerResult {
-                accepted_connections: 1,
-                ..Default::default()
-            };
-            if let Ok(stream) = acceptor.accept(stream) {
-                let smtp = run_server(stream, &config);
-                result.commands = smtp.commands;
-                result.captured_message = smtp.captured_message;
-                result.captured_messages = smtp.captured_messages;
+            let mut result = ServerResult::default();
+            for config in configs {
+                let (stream, _) = listener.accept().expect("accept failed");
+                stream
+                    .set_read_timeout(Some(TEST_TIMEOUT))
+                    .expect("read timeout");
+                stream
+                    .set_write_timeout(Some(TEST_TIMEOUT))
+                    .expect("write timeout");
+                result.accepted_connections += 1;
+                if let Ok(stream) = acceptor.accept(stream) {
+                    let smtp = run_server(stream, &config);
+                    result.commands.extend(smtp.commands);
+                    result.captured_message.extend(smtp.captured_message);
+                    result.captured_messages.extend(smtp.captured_messages);
+                }
             }
             result
         });
@@ -402,6 +410,9 @@ fn run_server<S: Read + Write>(stream: S, config: &SmarthostConfig) -> ServerRes
 
         if line.starts_with(b"EHLO ") || line.starts_with(b"ehlo ") {
             reader.get_mut().write_all(&config.ehlo_response).unwrap();
+            reader.get_mut().flush().unwrap();
+        } else if line.starts_with(b"AUTH PLAIN ") {
+            reader.get_mut().write_all(&config.auth_response).unwrap();
             reader.get_mut().flush().unwrap();
         } else if line.starts_with(b"MAIL FROM:") {
             if config.close_point == ClosePoint::BeforeMailReply(mail_idx) {

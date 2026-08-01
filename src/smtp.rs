@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use openssl::ssl::{HandshakeError, SslConnector, SslMethod, SslVerifyMode};
 
+use crate::config::Secret;
 use crate::relay::{DeliveryResult, Envelope};
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -454,6 +455,7 @@ pub struct SmtpConnection {
     client_name: String,
     connector: StreamConnector,
     session: Option<Session>,
+    auth: Option<(String, Secret)>,
 }
 
 impl SmtpConnection {
@@ -465,6 +467,7 @@ impl SmtpConnection {
             client_name: client_name.into(),
             connector: Box::new(connector),
             session: None,
+            auth: None,
         }
     }
 
@@ -480,6 +483,40 @@ impl SmtpConnection {
         relay_port: u16,
         timeout: Duration,
         ca_file: Option<&Path>,
+    ) -> io::Result<Self> {
+        Self::new_implicit_tls_inner(client_name, relay_host, relay_port, timeout, ca_file, None)
+    }
+
+    /// Create a reusable verified implicit-TLS connection with AUTH PLAIN.
+    ///
+    /// Keeping authentication on a TLS-only constructor makes credentials
+    /// impossible to configure on [`SmtpConnection::new`].
+    pub fn new_implicit_tls_with_auth(
+        client_name: impl Into<String>,
+        relay_host: impl Into<String>,
+        relay_port: u16,
+        timeout: Duration,
+        ca_file: Option<&Path>,
+        username: String,
+        password: Secret,
+    ) -> io::Result<Self> {
+        Self::new_implicit_tls_inner(
+            client_name,
+            relay_host,
+            relay_port,
+            timeout,
+            ca_file,
+            Some((username, password)),
+        )
+    }
+
+    fn new_implicit_tls_inner(
+        client_name: impl Into<String>,
+        relay_host: impl Into<String>,
+        relay_port: u16,
+        timeout: Duration,
+        ca_file: Option<&Path>,
+        auth: Option<(String, Secret)>,
     ) -> io::Result<Self> {
         if timeout.is_zero() {
             return Err(io::Error::new(
@@ -504,9 +541,11 @@ impl SmtpConnection {
         let connector = builder.build();
         let connect_host = relay_host.clone();
 
-        Ok(Self::new(client_name, move || {
+        let mut connection = Self::new(client_name, move || {
             connect_verified_tls(&connector, &connect_host, relay_port, timeout)
-        }))
+        });
+        connection.auth = auth;
+        Ok(connection)
     }
 
     /// Deliver a message, reconnecting at most once when explicit attempt
@@ -549,7 +588,9 @@ impl SmtpConnection {
             let mut session = Session {
                 stream: io::BufReader::new(stream),
             };
-            if let Err(outcome) = initialize_session(&mut session, &self.client_name) {
+            if let Err(outcome) =
+                initialize_session(&mut session, &self.client_name, self.auth.as_ref())
+            {
                 return outcome;
             }
             self.session = Some(session);
@@ -653,7 +694,11 @@ fn read_session_reply(session: &mut Session, context: &str) -> Result<SmtpReply,
     })
 }
 
-fn initialize_session(session: &mut Session, client_name: &str) -> Result<(), AttemptOutcome> {
+fn initialize_session(
+    session: &mut Session,
+    client_name: &str,
+    auth: Option<&(String, Secret)>,
+) -> Result<(), AttemptOutcome> {
     let greeting = read_session_reply(session, "greeting")?;
     if greeting.code != 220 {
         return Err(AttemptOutcome::smtp(
@@ -673,7 +718,134 @@ fn initialize_session(session: &mut Session, client_name: &str) -> Result<(), At
             reply.code != 221,
         ));
     }
+    if let Some((username, password)) = auth {
+        if !advertises_auth_plain(&reply) {
+            return Err(AttemptOutcome::smtp(
+                DeliveryResult::permanent_failure(
+                    "AUTH PLAIN is not advertised by the smarthost".to_owned(),
+                    None,
+                ),
+                false,
+            ));
+        }
+        authenticate_plain(session, username.as_bytes(), password.as_bytes())?;
+    }
     Ok(())
+}
+
+fn advertises_auth_plain(reply: &SmtpReply) -> bool {
+    reply.lines.iter().any(|line| {
+        let mut words = line.split(|byte| byte.is_ascii_whitespace());
+        matches!(words.next(), Some(word) if word.eq_ignore_ascii_case(b"AUTH"))
+            && words.any(|word| word.eq_ignore_ascii_case(b"PLAIN"))
+    })
+}
+
+fn authenticate_plain(
+    session: &mut Session,
+    username: &[u8],
+    password: &[u8],
+) -> Result<(), AttemptOutcome> {
+    let plaintext_len = username
+        .len()
+        .checked_add(password.len())
+        .and_then(|length| length.checked_add(2))
+        .ok_or_else(auth_size_failure)?;
+    let mut plaintext = Vec::new();
+    plaintext
+        .try_reserve_exact(plaintext_len)
+        .map_err(|_| auth_size_failure())?;
+    plaintext.push(0);
+    plaintext.extend_from_slice(username);
+    plaintext.push(0);
+    plaintext.extend_from_slice(password);
+
+    let encoded_result = checked_base64(&plaintext);
+    erase_vec(&mut plaintext);
+    let mut encoded = encoded_result.map_err(|()| auth_size_failure())?;
+
+    let write_result = (|| {
+        let writer = session.stream.get_mut();
+        writer.write_all(b"AUTH PLAIN ")?;
+        writer.write_all(&encoded)?;
+        writer.write_all(b"\r\n")?;
+        writer.flush()
+    })();
+    erase_vec(&mut encoded);
+    if let Err(error) = write_result {
+        return Err(AttemptOutcome::transport(
+            DeliveryResult::temporary_failure(format!("AUTH write: {error}"), None),
+            true,
+        ));
+    }
+
+    let reply = read_session_reply(session, "AUTH")?;
+    match reply.code {
+        235 => Ok(()),
+        400..=499 => Err(AttemptOutcome::smtp(
+            DeliveryResult::temporary_failure(format!("AUTH: {}", reply.code), Some(reply.code)),
+            true,
+        )),
+        500..=599 => Err(AttemptOutcome::smtp(
+            DeliveryResult::permanent_failure(format!("AUTH: {}", reply.code), Some(reply.code)),
+            reply.code != 521,
+        )),
+        _ => Err(AttemptOutcome::smtp(
+            DeliveryResult::permanent_failure(
+                format!("AUTH: unexpected reply code {}", reply.code),
+                Some(reply.code),
+            ),
+            false,
+        )),
+    }
+}
+
+fn auth_size_failure() -> AttemptOutcome {
+    AttemptOutcome::smtp(
+        DeliveryResult::permanent_failure(
+            "AUTH credentials exceed protocol limits".to_owned(),
+            None,
+        ),
+        false,
+    )
+}
+
+fn checked_base64(input: &[u8]) -> Result<Vec<u8>, ()> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let output_len = input
+        .len()
+        .checked_add(2)
+        .map(|length| length / 3)
+        .and_then(|length| length.checked_mul(4))
+        .ok_or(())?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(output_len).map_err(|_| ())?;
+    for chunk in input.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(ALPHABET[(first >> 2) as usize]);
+        output.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize]);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize]
+        } else {
+            b'='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[(third & 0x3f) as usize]
+        } else {
+            b'='
+        });
+    }
+    debug_assert_eq!(output.len(), output_len);
+    Ok(output)
+}
+
+fn erase_vec(bytes: &mut Vec<u8>) {
+    for byte in bytes.as_mut_slice() {
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 fn run_transaction(
@@ -802,6 +974,28 @@ mod tests {
 
     fn reader(bytes: &[u8]) -> io::BufReader<Cursor<&[u8]>> {
         io::BufReader::new(Cursor::new(bytes))
+    }
+
+    #[test]
+    fn auth_plain_base64_matches_rfc_encoding() {
+        assert_eq!(
+            checked_base64(b"\0alice\0s3cret").unwrap(),
+            b"AGFsaWNlAHMzY3JldA=="
+        );
+        assert_eq!(checked_base64(b"").unwrap(), b"");
+        assert_eq!(checked_base64(b"a").unwrap(), b"YQ==");
+        assert_eq!(checked_base64(b"ab").unwrap(), b"YWI=");
+        assert_eq!(checked_base64(b"abc").unwrap(), b"YWJj");
+    }
+
+    #[test]
+    fn auth_temporary_plaintext_and_encoded_buffers_are_overwritten() {
+        let mut plaintext = b"\0alice\0s3cret".to_vec();
+        let mut encoded = checked_base64(&plaintext).unwrap();
+        erase_vec(&mut plaintext);
+        erase_vec(&mut encoded);
+        assert!(plaintext.iter().all(|byte| *byte == 0));
+        assert!(encoded.iter().all(|byte| *byte == 0));
     }
 
     // ── Single-line ────────────────────────────────────────────────

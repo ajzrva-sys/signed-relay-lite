@@ -10,6 +10,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use common::{ClosePoint, FakeSmarthost, ServerResult, SmarthostConfig, TestPki};
+use signed_relay_lite::config::Secret;
 use signed_relay_lite::relay::{DeliveryResult, DeliveryStatus, Envelope};
 use signed_relay_lite::smtp::{deliver, SmtpConnection, SmtpStream};
 
@@ -29,6 +30,174 @@ fn tls_connection(
         ca_file,
     )
     .expect("construct TLS connector")
+}
+
+fn authenticated_tls_connection(server: &FakeSmarthost, pki: &TestPki) -> SmtpConnection {
+    SmtpConnection::new_implicit_tls_with_auth(
+        "test-client",
+        "localhost",
+        server.addr.port(),
+        TLS_TIMEOUT,
+        Some(&pki.ca_file),
+        "alice".to_owned(),
+        Secret::new(b"s3cret".to_vec()),
+    )
+    .expect("construct authenticated TLS connector")
+}
+
+#[test]
+fn tls_auth_plain_occurs_after_ehlo_and_before_mail() {
+    let pki = TestPki::localhost();
+    let server = FakeSmarthost::start_tls(
+        SmarthostConfig {
+            ehlo_response: b"250-localhost\r\n250-aUtH login PLAIN\r\n250 OK\r\n".to_vec(),
+            ..SmarthostConfig::default()
+        },
+        pki.acceptor(),
+    );
+    let mut connection = authenticated_tls_connection(&server, &pki);
+    let result = connection.deliver(&test_envelope(), b"sig", b"body\r\n");
+    drop(connection);
+    let observed = server.join();
+
+    assert!(result.is_accepted(), "{result:?}");
+    assert_eq!(observed.commands[0], b"EHLO test-client\r\n");
+    assert_eq!(observed.commands[1], b"AUTH PLAIN AGFsaWNlAHMzY3JldA==\r\n");
+    assert!(observed.commands[2].starts_with(b"MAIL FROM:"));
+}
+
+#[test]
+fn tls_without_credentials_omits_auth() {
+    let pki = TestPki::localhost();
+    let server = FakeSmarthost::start_tls(
+        SmarthostConfig {
+            ehlo_response: b"250-localhost\r\n250 AUTH PLAIN\r\n".to_vec(),
+            ..SmarthostConfig::default()
+        },
+        pki.acceptor(),
+    );
+    let mut connection = tls_connection(&server, "localhost", Some(&pki.ca_file));
+    assert!(connection
+        .deliver(&test_envelope(), b"sig", b"body\r\n")
+        .is_accepted());
+    drop(connection);
+    let observed = server.join();
+    assert!(!observed
+        .commands
+        .iter()
+        .any(|command| command.starts_with(b"AUTH ")));
+}
+
+#[test]
+fn tls_auth_reply_is_classified_and_diagnostics_are_redacted() {
+    for (response, expected) in [
+        (
+            b"454 temporary auth failure\r\n".as_slice(),
+            DeliveryStatus::TemporaryFailure,
+        ),
+        (
+            b"535 permanent auth failure\r\n".as_slice(),
+            DeliveryStatus::PermanentFailure,
+        ),
+    ] {
+        let pki = TestPki::localhost();
+        let server = FakeSmarthost::start_tls(
+            SmarthostConfig {
+                ehlo_response: b"250-localhost\r\n250 AUTH PLAIN\r\n".to_vec(),
+                auth_response: response.to_vec(),
+                ..SmarthostConfig::default()
+            },
+            pki.acceptor(),
+        );
+        let mut connection = authenticated_tls_connection(&server, &pki);
+        let result = connection.deliver(&test_envelope(), b"sig", b"body\r\n");
+        drop(connection);
+        let observed = server.join();
+        assert_eq!(result.status, expected, "{result:?}");
+        assert!(!result.diagnostic.contains("alice"));
+        assert!(!result.diagnostic.contains("s3cret"));
+        assert!(!result.diagnostic.contains("AGFsaWNlAHMzY3JldA=="));
+        assert!(!observed
+            .commands
+            .iter()
+            .any(|command| command.starts_with(b"MAIL ")));
+    }
+}
+
+#[test]
+fn tls_auth_requires_advertised_plain_without_sending_credentials() {
+    let pki = TestPki::localhost();
+    let server = FakeSmarthost::start_tls(SmarthostConfig::default(), pki.acceptor());
+    let mut connection = authenticated_tls_connection(&server, &pki);
+    let result = connection.deliver(&test_envelope(), b"sig", b"body\r\n");
+    drop(connection);
+    let observed = server.join();
+    assert_eq!(result.status, DeliveryStatus::PermanentFailure);
+    assert_eq!(observed.commands, vec![b"EHLO test-client\r\n".to_vec()]);
+}
+
+#[test]
+fn tls_auth_is_once_per_session_not_per_message() {
+    let pki = TestPki::localhost();
+    let config = SmarthostConfig {
+        ehlo_response: b"250-localhost\r\n250 AUTH PLAIN\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start_tls(config, pki.acceptor());
+    let mut connection = authenticated_tls_connection(&server, &pki);
+    assert!(connection
+        .deliver(&test_envelope(), b"one", b"first\r\n")
+        .is_accepted());
+    assert!(connection
+        .deliver(&test_envelope(), b"two", b"second\r\n")
+        .is_accepted());
+    drop(connection);
+    let observed = server.join();
+    assert_eq!(
+        observed
+            .commands
+            .iter()
+            .filter(|command| command.starts_with(b"AUTH "))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn tls_auth_repeats_after_reconnect() {
+    let pki = TestPki::localhost();
+    let config = SmarthostConfig {
+        ehlo_response: b"250-localhost\r\n250 AUTH PLAIN\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start_tls_connections(
+        vec![
+            SmarthostConfig {
+                close_point: ClosePoint::AfterDataReply,
+                ..config.clone()
+            },
+            config,
+        ],
+        pki.acceptor(),
+    );
+    let mut connection = authenticated_tls_connection(&server, &pki);
+    assert!(connection
+        .deliver(&test_envelope(), b"one", b"first\r\n")
+        .is_accepted());
+    assert!(connection
+        .deliver(&test_envelope(), b"two", b"second\r\n")
+        .is_accepted());
+    drop(connection);
+    let observed = server.join();
+    assert_eq!(observed.accepted_connections, 2);
+    assert_eq!(
+        observed
+            .commands
+            .iter()
+            .filter(|command| command.starts_with(b"AUTH "))
+            .count(),
+        2
+    );
 }
 
 fn test_envelope() -> Envelope {
