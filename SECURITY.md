@@ -16,8 +16,10 @@ host. Its attack surface splits into two planes:
 * There is **no per-connection authentication** beyond filesystem access
   control on the socket. The design assumption is that all local processes
   able to connect are trusted.
-* The SRL1 wire protocol is fixed-format and length-prefixed; every field
-  has an explicit size bound checked before allocation.
+* SRL2 sends a bounded envelope, then the daemon returns `READY` with its
+  configured message limit or an early `FINAL`. Only after `READY` does the
+  client send bounded length-prefixed chunks, followed by a zero-length `END`
+  and the daemon's `FINAL`. SRL1 is intentionally incompatible and rejected.
 
 ### Relay plane (upstream smarthost)
 
@@ -36,7 +38,7 @@ host. Its attack surface splits into two planes:
 | Limit | Controlled by |
 |---|---|
 | Per-message size | `max_message_bytes` |
-| Total in-flight message memory | `global_message_memory_bytes` |
+| Total retained message bytes | `global_message_memory_bytes` |
 | Concurrent submissions | `max_concurrent_submissions` |
 | Recipients per envelope | hardcoded (100) |
 | Single address length | hardcoded (254 bytes) |
@@ -45,7 +47,20 @@ host. Its attack surface splits into two planes:
 | Submission timeout | `submission_timeout_seconds` |
 | Delivery timeout | `delivery_timeout_seconds` |
 
-All limits are enforced **before** allocating memory for the decoded payload.
+The daemon checks a chunk's length, cumulative message length, and incremental
+global retained-byte reservation before reading that chunk payload or appending
+it. `global_message_memory_bytes` accounts for retained message lengths; it is
+not a bound on `Vec` capacity, allocator overhead, process RSS, or the fixed
+per-handler chunk scratch buffers. Budget exhaustion returns an unambiguous
+temporary failure rather than blocking, and no SMTP attempt is made.
+
+The daemon owns `max_message_bytes` and advertises it in `READY`; the client has
+no hidden message ceiling and reads stdin only after `READY`. It normalizes
+CR/LF while streaming through bounded input and chunk buffers instead of
+retaining a second whole-message copy. Oversized normalized input is an
+unambiguous local usage/protocol failure with no SMTP attempt. Submission
+timeouts, truncation, and malformed frames are protocol rejections with no
+delivery attempt.
 
 ### Ambiguous delivery and duplication
 

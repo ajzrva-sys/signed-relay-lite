@@ -15,10 +15,10 @@ it, and relay it to exactly one preconfigured smarthost over implicit TLS.
 |---|---|
 | **Single smarthost** | All mail is delivered to `relay_host:relay_port`. No routing, no MX lookups, no queue directories. |
 | **No disk queue** | Messages live only in process memory. If the daemon exits, undelivered messages are lost. |
-| **Caller owns retries** | The submitter (the `signed-relay-sendmail` client or any SRL1-speaking program) is responsible for retrying reported transient failures. The daemon may reconnect once after a transport failure proven to occur before `DATA`; it never retries after `DATA` is accepted or body transmission begins. |
+| **Caller owns retries** | The submitter is responsible for retrying reported transient failures. The daemon may reconnect once after a transport failure proven to occur before `DATA`; it never retries after `DATA` is accepted or body transmission begins. |
 | **Local success = upstream 2xx** | An exit code of `EX_OK` (0) from `signed-relay-sendmail` means the remote smarthost returned a final `2xx` after the message terminator. This is a stronger guarantee than "accepted into a local queue." |
 | **Ambiguous failures may duplicate** | If the connection drops after `DATA` but before the final acceptance reply, the result is marked *ambiguous*. Retrying an ambiguous submission may deliver the message twice. Callers must be prepared for this. |
-| **Bounded memory** | `global_message_memory_bytes` caps retained bytes for in-flight messages. A submission that cannot reserve its declared message size receives a temporary failure. Per-message size is bounded by `max_message_bytes`. |
+| **Bounded retained data** | `global_message_memory_bytes` caps retained message bytes across in-flight submissions. Exhaustion returns a temporary failure; it does not block. `max_message_bytes` bounds each normalized message. These accounting limits do not cap `Vec` capacity, allocator overhead, process RSS, or bounded temporary chunk buffers. |
 | **TLS always verified** | Certificate verification (`SslVerifyMode::PEER`) is hardcoded and cannot be disabled. |
 | **No SMTPUTF8** | v0.1 does not advertise or support the `SMTPUTF8` SMTP extension. International addresses must be encoded with the standards that predate it. |
 
@@ -35,12 +35,18 @@ signed-relay-sendmail [-f envelope-from] [--] recipient...
 * `--` — optional separator; everything after it is treated as a recipient
   even if it starts with `-`.
 * One or more recipient addresses must follow.
-* The message body is read from **stdin**.
+* The message body is read from **stdin only after** the daemon accepts the
+  envelope and advertises its active limits in `READY`.
 * The submission socket path defaults to `/run/signed-relay-lite/submit.sock`
   and can be overridden with the `SIGNED_RELAY_SOCKET` environment variable
   (must be an absolute path).
 
 No other `sendmail` flags (`-t`, `-i`, `-o`, etc.) are recognized.
+
+The client has no hidden message-size ceiling. It uses the daemon's configured
+`max_message_bytes`, normalizes CR/LF to CRLF while streaming, and sends bounded
+chunks instead of buffering the whole message. If normalized input exceeds the
+advertised limit, submission fails locally with no SMTP attempt.
 
 ### Exit codes
 
@@ -49,7 +55,26 @@ No other `sendmail` flags (`-t`, `-i`, `-o`, etc.) are recognized.
 | 0 | `EX_OK` | Delivered — upstream `250` observed. |
 | 64 | `EX_USAGE` | Invalid arguments or oversized message. |
 | 69 | `EX_UNAVAILABLE` | Permanent failure (`5xx` from smarthost). |
-| 75 | `EX_TEMPFAIL` | Transient failure — safe to retry. |
+| 74 | `EX_IOERR` | Local input/socket I/O failure or incomplete submission result. |
+| 75 | `EX_TEMPFAIL` | Transient or ambiguous failure; retrying an ambiguous result may duplicate delivery. |
+| 76 | `EX_PROTOCOL` | Invalid daemon response or advertised limits. |
+
+## Local submission protocol
+
+SRL2 sends an envelope first. The daemon then returns either an early `FINAL`
+rejection or `READY` with its configured message limit and the bounded chunk
+limit. After `READY`, the client sends length-prefixed chunks, a zero-length
+`END`, and receives `FINAL`. SRL1 is intentionally incompatible and rejected;
+clients must migrate to SRL2.
+
+The daemon checks each chunk length, cumulative retained length, and global
+retained-message budget before reading that chunk's payload into its fixed-size
+scratch buffer or appending it. Budget exhaustion is an unambiguous temporary
+failure with no SMTP attempt. Oversize normalized input is an unambiguous local
+usage/protocol failure with no SMTP attempt. Timeout, truncation, and malformed
+submission frames are protocol rejections and are not delivered. Once SMTP
+`DATA` begins, the existing ambiguity rule still applies: loss before the final
+SMTP reply may mean the message was delivered.
 
 ## Building
 
@@ -79,6 +104,7 @@ cargo install cargo-fuzz
 
 # Run a specific target
 cargo fuzz run submission_frame
+cargo fuzz run submission_stream
 cargo fuzz run message
 cargo fuzz run smtp_response
 ```
@@ -113,8 +139,8 @@ See [`example.conf`](example.conf) for a fully commented template.
 | `relay_password_file` | absolute path | File containing the SMTP AUTH password (raw bytes, no trailing newline handling). Both `relay_username` and `relay_password_file` must be set or both must be empty. |
 | `client_name` | DNS name | EHLO/HELO hostname sent to the smarthost. |
 | `relay_workers` | usize | Number of dedicated SMTP delivery threads. Must not exceed `max_concurrent_submissions`. |
-| `max_message_bytes` | usize | Per-message size limit in bytes (default example: 25 MiB). |
-| `global_message_memory_bytes` | usize | Total in-flight message memory cap. Must be ≥ `max_message_bytes`. |
+| `max_message_bytes` | usize | Daemon-authoritative limit for each normalized message; advertised to SRL2 clients. |
+| `global_message_memory_bytes` | usize | Total retained message-byte budget. Must be ≥ `max_message_bytes`; exhaustion returns a temporary failure. It is not a process-RSS cap. |
 | `max_concurrent_submissions` | usize | Maximum simultaneous submission handlers. |
 | `submission_timeout_seconds` | u64 | Inactivity timeout applied to submission socket reads and writes. |
 | `delivery_timeout_seconds` | u64 | Connection and per-I/O inactivity timeout for upstream SMTP. |

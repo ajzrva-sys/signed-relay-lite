@@ -1,4 +1,8 @@
-//! Bounded immutable RFC 5321 wire-message parser.
+//! Bounded immutable RFC 5321 wire-message parsing and streaming normalization.
+//!
+//! [`WireNormalizer`] converts arbitrary CR/LF input to canonical CRLF while
+//! writing incrementally to a caller-provided sink, so submission clients need
+//! not retain the complete normalized message.
 
 use crate::dkim::BodyCanonicalizer;
 use std::ops::Range;

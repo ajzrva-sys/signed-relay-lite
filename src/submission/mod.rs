@@ -1,4 +1,10 @@
-//! Strict bounded submission codecs and SRL2 Unix-domain server.
+//! Strict bounded SRL2 submission codecs and Unix-domain server.
+//!
+//! A client sends an envelope and waits for daemon-authoritative `READY` limits
+//! (or an early `FINAL`) before streaming bounded chunks, a zero-length end
+//! marker, and receiving `FINAL`. SRL1 frames are intentionally rejected.
+//! Retained message bytes are globally budgeted separately from bounded
+//! temporary chunk buffers and process memory overhead.
 
 mod budget;
 mod protocol;
