@@ -7,6 +7,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use openssl::x509::extension::{BasicConstraints, KeyUsage, SubjectAlternativeNam
 use openssl::x509::{X509NameBuilder, X509};
 
 /// Global per-test timeout for any network wait.
-const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ── Public types ──────────────────────────────────────────────────────
 
@@ -29,6 +30,58 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct FakeSmarthost {
     pub addr: SocketAddr,
     handle: Option<JoinHandle<ServerResult>>,
+}
+
+/// Cloneable, bounded gate positioned after DATA capture and before final 250.
+#[derive(Clone, Debug)]
+pub struct FinalResponseGate {
+    state: Arc<(Mutex<GateState>, Condvar)>,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    captured: bool,
+    released: bool,
+}
+
+impl FinalResponseGate {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(GateState::default()), Condvar::new())),
+        }
+    }
+
+    pub fn wait_until_captured(&self) {
+        let (lock, changed) = &*self.state;
+        let state = lock.lock().unwrap();
+        let (state, timeout) = changed
+            .wait_timeout_while(state, Duration::from_secs(2), |state| !state.captured)
+            .unwrap();
+        assert!(
+            state.captured && !timeout.timed_out(),
+            "DATA capture timed out"
+        );
+    }
+
+    pub fn release(&self) {
+        let (lock, changed) = &*self.state;
+        lock.lock().unwrap().released = true;
+        changed.notify_all();
+    }
+
+    fn captured_and_wait_for_release(&self) {
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        state.captured = true;
+        changed.notify_all();
+        let (state, timeout) = changed
+            .wait_timeout_while(state, Duration::from_secs(2), |state| !state.released)
+            .unwrap();
+        assert!(
+            state.released && !timeout.timed_out(),
+            "final response gate timed out"
+        );
+    }
 }
 
 /// Runtime-generated test PKI and its temporary CA trust file.
@@ -187,6 +240,8 @@ pub struct SmarthostConfig {
     pub data_final_response: Vec<u8>,
     /// Where to simulate a connection drop.
     pub close_point: ClosePoint,
+    /// Optional gate after the complete unstuffed DATA message is captured.
+    pub final_response_gate: Option<FinalResponseGate>,
 }
 
 impl Default for SmarthostConfig {
@@ -200,6 +255,7 @@ impl Default for SmarthostConfig {
             data_go_ahead: b"354 Go ahead\r\n".to_vec(),
             data_final_response: b"250 OK\r\n".to_vec(),
             close_point: ClosePoint::Normal,
+            final_response_gate: None,
         }
     }
 }
@@ -377,14 +433,17 @@ fn run_server<S: Read + Write>(stream: S, config: &SmarthostConfig) -> ServerRes
                 if config.close_point == ClosePoint::AfterFinalDot {
                     break;
                 }
+                result
+                    .captured_messages
+                    .push(std::mem::take(&mut current_message));
+                if let Some(gate) = &config.final_response_gate {
+                    gate.captured_and_wait_for_release();
+                }
                 reader
                     .get_mut()
                     .write_all(&config.data_final_response)
                     .unwrap();
                 reader.get_mut().flush().unwrap();
-                result
-                    .captured_messages
-                    .push(std::mem::take(&mut current_message));
                 in_data = false;
                 if config.close_point == ClosePoint::AfterDataReply {
                     break;

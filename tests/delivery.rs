@@ -8,19 +8,421 @@ mod common;
 
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{ClosePoint, FakeSmarthost, ServerResult, SmarthostConfig, TestPki};
-use signed_relay_lite::config::Secret;
+use common::{
+    ClosePoint, FakeSmarthost, FinalResponseGate, ServerResult, SmarthostConfig, TestPki,
+};
+use openssl::hash::{hash, MessageDigest};
+use openssl::pkey::{PKey, Public};
+use openssl::rsa::Rsa;
+use openssl::sign::Verifier;
+use signed_relay_lite::config::{Secret, SigningConfig};
 use signed_relay_lite::message::{Limits, Message};
 use signed_relay_lite::relay::{DeliveryJob, DeliveryResult, DeliveryStatus, Envelope, RelayPool};
 use signed_relay_lite::smtp::{deliver, SmtpConnection, SmtpStream};
+use signed_relay_lite::submission::{
+    read_response, MemoryBudget, SubmissionLimits, SubmissionServer,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const TLS_TIMEOUT: Duration = Duration::from_millis(300);
+static NEXT_E2E_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct RawHeader<'a> {
+    name: &'a [u8],
+    value: &'a [u8],
+}
+
+fn split_message(message: &[u8]) -> Option<(Vec<RawHeader<'_>>, &[u8], usize)> {
+    let separator = message.windows(4).position(|bytes| bytes == b"\r\n\r\n")?;
+    let block = &message[..separator + 2];
+    let mut headers = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index + 1 < block.len() {
+        if &block[index..index + 2] == b"\r\n" {
+            let next = index + 2;
+            if next < block.len() && matches!(block[next], b' ' | b'\t') {
+                index = next;
+                continue;
+            }
+            let field = &block[start..index];
+            let colon = field.iter().position(|byte| *byte == b':')?;
+            headers.push(RawHeader {
+                name: &field[..colon],
+                value: &field[colon + 1..],
+            });
+            start = next;
+            index = next;
+        } else {
+            index += 1;
+        }
+    }
+    Some((headers, &message[separator + 4..], separator + 4))
+}
+
+fn relaxed_header(name: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut output: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
+    output.push(b':');
+    let mut whitespace = false;
+    for &byte in value {
+        match byte {
+            b' ' | b'\t' | b'\r' | b'\n' => whitespace = true,
+            _ => {
+                if whitespace && output.last() != Some(&b':') {
+                    output.push(b' ');
+                }
+                whitespace = false;
+                output.push(byte);
+            }
+        }
+    }
+    output.extend_from_slice(b"\r\n");
+    output
+}
+
+fn relaxed_body(body: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut nonempty_lines = Vec::new();
+    for line in body
+        .strip_suffix(b"\r\n")
+        .unwrap_or(body)
+        .split(|byte| *byte == b'\n')
+    {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let mut canonical = Vec::new();
+        let mut whitespace = false;
+        for &byte in line {
+            if matches!(byte, b' ' | b'\t') {
+                whitespace = true;
+            } else {
+                if whitespace && !canonical.is_empty() {
+                    canonical.push(b' ');
+                }
+                whitespace = false;
+                canonical.push(byte);
+            }
+        }
+        nonempty_lines.push(canonical);
+    }
+    while nonempty_lines.last().is_some_and(Vec::is_empty) {
+        nonempty_lines.pop();
+    }
+    for line in nonempty_lines {
+        output.extend_from_slice(&line);
+        output.extend_from_slice(b"\r\n");
+    }
+    if output.is_empty() {
+        output.extend_from_slice(b"\r\n");
+    }
+    output
+}
+
+fn unfolded(value: &[u8]) -> Vec<u8> {
+    value
+        .iter()
+        .copied()
+        .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+        .collect()
+}
+
+fn tag<'a>(value: &'a [u8], wanted: &[u8]) -> Option<&'a [u8]> {
+    value.split(|byte| *byte == b';').find_map(|part| {
+        let equals = part.iter().position(|byte| *byte == b'=')?;
+        let name = part[..equals]
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        name.eq_ignore_ascii_case(wanted)
+            .then_some(&part[equals + 1..])
+    })
+}
+
+fn signature_without_b(value: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(value.len());
+    let mut offset = 0;
+    for part in value.split_inclusive(|byte| *byte == b';') {
+        let equals = part.iter().position(|byte| *byte == b'=')?;
+        let name: Vec<_> = part[..equals]
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace() && *byte != b';')
+            .collect();
+        if name.eq_ignore_ascii_case(b"b") {
+            output.extend_from_slice(&part[..equals + 1]);
+            output.extend(
+                part[equals + 1..]
+                    .iter()
+                    .copied()
+                    .filter(|byte| byte.is_ascii_whitespace() || *byte == b';'),
+            );
+            output.extend_from_slice(&value[offset + part.len()..]);
+            return Some(output);
+        }
+        output.extend_from_slice(part);
+        offset += part.len();
+    }
+    None
+}
+
+fn verify_captured_dkim(message: &[u8], public_key: &PKey<Public>, selector: &str) -> bool {
+    (|| -> Option<bool> {
+        let (headers, body, _) = split_message(message)?;
+        let dkim = headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case(b"DKIM-Signature"))?;
+        let required = [
+            (b"v".as_slice(), b"1".as_slice()),
+            (b"a".as_slice(), b"rsa-sha256".as_slice()),
+            (b"c".as_slice(), b"relaxed/relaxed".as_slice()),
+            (b"d".as_slice(), b"example.com".as_slice()),
+            (b"s".as_slice(), selector.as_bytes()),
+        ];
+        for (name, expected) in required {
+            if unfolded(tag(dkim.value, name)?) != expected {
+                return Some(false);
+            }
+        }
+        let h = unfolded(tag(dkim.value, b"h")?);
+        let bh = unfolded(tag(dkim.value, b"bh")?);
+        let signature = unfolded(tag(dkim.value, b"b")?);
+        if h != b"from:from:subject:to:content-type" || bh.is_empty() || signature.is_empty() {
+            return Some(false);
+        }
+        let expected_body_hash = hash(MessageDigest::sha256(), &relaxed_body(body)).ok()?;
+        if openssl::base64::decode_block(std::str::from_utf8(&bh).ok()?).ok()?
+            != expected_body_hash.as_ref()
+        {
+            return Some(false);
+        }
+
+        let originals: Vec<_> = headers
+            .iter()
+            .copied()
+            .filter(|header| !header.name.eq_ignore_ascii_case(b"DKIM-Signature"))
+            .collect();
+        let mut used = vec![false; originals.len()];
+        let mut signed_data = Vec::new();
+        for name in h.split(|byte| *byte == b':') {
+            if let Some(index) = (0..originals.len())
+                .rev()
+                .find(|&index| !used[index] && originals[index].name.eq_ignore_ascii_case(name))
+            {
+                used[index] = true;
+                signed_data.extend_from_slice(&relaxed_header(
+                    originals[index].name,
+                    originals[index].value,
+                ));
+            }
+        }
+        let empty_b = signature_without_b(dkim.value)?;
+        let mut canonical_signature = relaxed_header(b"DKIM-Signature", &empty_b);
+        canonical_signature.truncate(canonical_signature.len() - 2);
+        signed_data.extend_from_slice(&canonical_signature);
+
+        let decoded_signature =
+            openssl::base64::decode_block(std::str::from_utf8(&signature).ok()?).ok()?;
+        let mut verifier = Verifier::new(MessageDigest::sha256(), public_key).ok()?;
+        verifier.update(&signed_data).ok()?;
+        verifier.verify(&decoded_signature).ok()
+    })()
+    .unwrap_or(false)
+}
+
+fn srl1_request(message: &[u8]) -> Vec<u8> {
+    let sender = b"sender@example.com";
+    let recipient = b"recipient@example.net";
+    let mut frame = b"SRL1".to_vec();
+    frame.extend_from_slice(&0_u32.to_be_bytes());
+    frame.extend_from_slice(&(sender.len() as u32).to_be_bytes());
+    frame.extend_from_slice(sender);
+    frame.extend_from_slice(&1_u32.to_be_bytes());
+    frame.extend_from_slice(&(recipient.len() as u32).to_be_bytes());
+    frame.extend_from_slice(recipient);
+    frame.extend_from_slice(&(message.len() as u64).to_be_bytes());
+    frame.extend_from_slice(message);
+    frame
+}
+
+fn first_header_end(message: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    loop {
+        let relative = message[offset..]
+            .windows(2)
+            .position(|bytes| bytes == b"\r\n")?;
+        let end = offset + relative + 2;
+        if !matches!(message.get(end), Some(b' ' | b'\t')) {
+            return Some(end);
+        }
+        offset = end;
+    }
+}
+
+fn mutate_tag(message: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut changed = message.to_vec();
+    let end = first_header_end(message).unwrap();
+    let value = &message[b"DKIM-Signature:".len()..end - 2];
+    let needle = [name, b"="].concat();
+    let start = value
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(&needle))
+        .unwrap()
+        + b"DKIM-Signature:".len()
+        + needle.len();
+    let target = (start..end)
+        .find(|&index| changed[index].is_ascii_alphanumeric())
+        .unwrap();
+    changed[target] = if changed[target] == b'A' { b'B' } else { b'A' };
+    changed
+}
+
+#[test]
+fn end_to_end_submission_waits_for_final_250_and_dkim_verifies() {
+    let signing_key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let public_key = PKey::public_key_from_pem(&signing_key.public_key_to_pem().unwrap()).unwrap();
+    let signing = SigningConfig {
+        domain: "example.com".to_owned(),
+        selector: "e2e".to_owned(),
+        key: Arc::new(signing_key),
+    };
+    let pki = TestPki::localhost();
+    let gate = FinalResponseGate::new();
+    let fake = FakeSmarthost::start_tls(
+        SmarthostConfig {
+            final_response_gate: Some(gate.clone()),
+            data_final_response: b"250 queued after verification gate\r\n".to_vec(),
+            ..SmarthostConfig::default()
+        },
+        pki.acceptor(),
+    );
+    let relay = Arc::new(RelayPool::new(1, 1, {
+        let port = fake.addr.port();
+        let ca_file = pki.ca_file.clone();
+        move || {
+            SmtpConnection::new_implicit_tls(
+                "e2e-client",
+                "localhost",
+                port,
+                Duration::from_secs(2),
+                Some(&ca_file),
+            )
+            .unwrap()
+        }
+    }));
+    let socket = PathBuf::from(format!(
+        "/tmp/signed-relay-lite-e2e-{}-{}.sock",
+        std::process::id(),
+        NEXT_E2E_SOCKET.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let limits = SubmissionLimits {
+        max_recipients: 4,
+        max_address_bytes: 254,
+        max_message_bytes: 64 * 1024,
+        max_diagnostic_bytes: 4096,
+    };
+    let server = SubmissionServer::bind(
+        &socket,
+        0o600,
+        Duration::from_secs(2),
+        1,
+        limits.clone(),
+        Limits::testing(),
+        MemoryBudget::new(1024 * 1024),
+        signing,
+        Arc::clone(&relay),
+        Arc::clone(&shutdown),
+    )
+    .unwrap();
+    let server_thread = thread::spawn(move || server.run().unwrap());
+
+    let mut original = b"From: Sender <sender@example.com>\r\n\
+Subject: earlier subject\r\n\
+Subject: signed subject\r\n\
+\tcontinued value\r\n\
+To: Recipient <recipient@example.net>\r\n\
+Content-Type: application/octet-stream\r\n\
+\r\n\
+first line with trailing spaces   \r\n\
+second\t\tline\t \r\n\
+.one leading dot\r\n"
+        .to_vec();
+    original.extend_from_slice(&[0xff, 0xfe, b' ', b'\t', b'\r', b'\n']);
+    original.extend_from_slice(b"\r\n");
+
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    let client_socket = socket.clone();
+    let client_limits = limits.clone();
+    let request = srl1_request(&original);
+    let client = thread::spawn(move || {
+        let mut stream = UnixStream::connect(client_socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(&request).unwrap();
+        let result = read_response(&mut stream, &client_limits).unwrap();
+        result_tx.send(result).unwrap();
+    });
+
+    gate.wait_until_captured();
+    assert!(result_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    gate.release();
+    let delivery = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(delivery.status, DeliveryStatus::Delivered);
+    assert_eq!(delivery.smtp_code, Some(250));
+    client.join().unwrap();
+
+    shutdown.store(true, Ordering::Release);
+    server_thread.join().unwrap();
+    drop(relay);
+    let observed = fake.join();
+    let captured = observed.captured_messages.first().unwrap();
+    let dkim_end = first_header_end(captured).unwrap();
+    assert_eq!(&captured[dkim_end..], original.as_slice());
+    assert!(captured
+        .windows(b"\r\n.one leading dot\r\n".len())
+        .any(|window| { window == b"\r\n.one leading dot\r\n" }));
+    assert!(captured.windows(2).any(|window| window == [0xff, 0xfe]));
+
+    let mut corrupted_body = captured.clone();
+    *corrupted_body.last_mut().unwrap() ^= 1;
+    assert!(!verify_captured_dkim(&corrupted_body, &public_key, "e2e"));
+    assert!(verify_captured_dkim(captured, &public_key, "e2e"));
+    assert!(!verify_captured_dkim(
+        &mutate_tag(captured, b"bh"),
+        &public_key,
+        "e2e"
+    ));
+    assert!(!verify_captured_dkim(
+        &mutate_tag(captured, b"b"),
+        &public_key,
+        "e2e"
+    ));
+    let mut duplicate_from = captured.clone();
+    let insertion = duplicate_from
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap()
+        + 2;
+    duplicate_from.splice(
+        insertion..insertion,
+        b"From: attacker@example.com\r\n".iter().copied(),
+    );
+    assert!(!verify_captured_dkim(&duplicate_from, &public_key, "e2e"));
+    assert!(!socket.exists());
+}
 
 struct ScriptedStream {
     replies: Cursor<Vec<u8>>,
