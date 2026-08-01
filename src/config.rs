@@ -344,7 +344,7 @@ pub fn check_fips_environment(required: bool) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         let path = Path::new("/proc/sys/crypto/fips_enabled");
-        return evaluate_linux_fips_status(fs::read_to_string(path), openssl_fips_enabled());
+        evaluate_linux_fips_status(fs::read_to_string(path), openssl_fips_enabled())
     }
 
     #[cfg(not(target_os = "linux"))]

@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -238,11 +238,11 @@ fn owned_stale_socket_is_replaced_and_mode_is_set() {
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
         Err(error) => panic!("bind stale test socket: {error}"),
     }
-    let stale_inode = fs::symlink_metadata(&path.0).unwrap().ino();
     let server = bind(&path.0, 0o620, Arc::new(AtomicBool::new(false))).unwrap();
     let metadata = fs::symlink_metadata(&path.0).unwrap();
-    assert_ne!(metadata.ino(), stale_inode);
+    let client = UnixStream::connect(&path.0).expect("replacement socket accepts connections");
     assert_eq!(metadata.permissions().mode() & 0o777, 0o620);
+    drop(client);
     drop(server);
     assert!(!path.0.exists());
 }
