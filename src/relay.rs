@@ -1,4 +1,12 @@
-//! Delivery result types for signed-relay-lite.
+//! Delivery result types and bounded workers for signed-relay-lite.
+
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+
+use crate::message::Message;
+use crate::smtp::SmtpConnection;
 
 /// Classification of a delivery attempt outcome.
 ///
@@ -28,6 +36,121 @@ pub struct DeliveryResult {
     pub ambiguous: bool,
     pub smtp_code: Option<u16>,
     pub diagnostic: String,
+}
+
+/// A complete unit of work accepted by a [`RelayPool`].
+pub struct DeliveryJob {
+    pub envelope: Envelope,
+    pub message: Message,
+    pub signature: Vec<u8>,
+    pub result_tx: SyncSender<DeliveryResult>,
+}
+
+/// A fixed set of SMTP delivery workers behind a bounded queue.
+pub struct RelayPool {
+    sender: Option<SyncSender<DeliveryJob>>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+/// The relay queue is no longer connected to any worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelayPoolClosed;
+
+impl RelayPool {
+    /// Start `worker_count` workers and a queue holding at most `queue_capacity` jobs.
+    ///
+    /// The factory is called independently by each worker, and again after a
+    /// panic invalidates that worker's connection. Both sizes must be positive.
+    pub fn new<F>(worker_count: usize, queue_capacity: usize, factory: F) -> Self
+    where
+        F: Fn() -> SmtpConnection + Send + Sync + 'static,
+    {
+        assert!(worker_count > 0, "relay worker count must be positive");
+        assert!(queue_capacity > 0, "relay queue capacity must be positive");
+
+        let (sender, receiver) = mpsc::sync_channel::<DeliveryJob>(queue_capacity);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let factory = Arc::new(factory);
+        let workers = (0..worker_count)
+            .map(|_| {
+                let receiver = Arc::clone(&receiver);
+                let factory = Arc::clone(&factory);
+                thread::spawn(move || {
+                    let mut connection = None;
+                    loop {
+                        let job = match receiver.lock() {
+                            Ok(receiver) => receiver.recv(),
+                            Err(_) => return,
+                        };
+                        let Ok(job) = job else { return };
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            let connection = connection.get_or_insert_with(|| factory());
+                            connection.deliver(
+                                &job.envelope,
+                                &job.signature,
+                                job.message.as_bytes(),
+                            )
+                        }));
+                        let result = match result {
+                            Ok(result) => result,
+                            Err(_) => {
+                                connection = None;
+                                DeliveryResult::temporary_failure(
+                                    "SMTP delivery worker panicked",
+                                    None,
+                                )
+                            }
+                        };
+                        let _ = job.result_tx.send(result);
+                    }
+                })
+            })
+            .collect();
+        Self {
+            sender: Some(sender),
+            workers,
+        }
+    }
+
+    /// Enqueue a job, blocking while the bounded queue is full.
+    pub fn enqueue(&self, job: DeliveryJob) -> Result<(), RelayPoolClosed> {
+        self.sender
+            .as_ref()
+            .expect("relay pool sender exists until drop")
+            .send(job)
+            .map_err(|_| RelayPoolClosed)
+    }
+
+    /// Enqueue and block until the worker reports the final SMTP result.
+    pub fn submit(
+        &self,
+        envelope: Envelope,
+        message: Message,
+        signature: Vec<u8>,
+    ) -> DeliveryResult {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let job = DeliveryJob {
+            envelope,
+            message,
+            signature,
+            result_tx,
+        };
+        if self.enqueue(job).is_err() {
+            return DeliveryResult::temporary_failure("relay worker queue disconnected", None);
+        }
+        result_rx.recv().unwrap_or_else(|_| {
+            DeliveryResult::temporary_failure("relay worker stopped without a result", None)
+        })
+    }
+}
+
+impl Drop for RelayPool {
+    fn drop(&mut self) {
+        self.sender.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
 }
 
 // ── bounded truncation helper ──────────────────────────────────────────

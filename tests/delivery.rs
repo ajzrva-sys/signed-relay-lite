@@ -6,16 +6,251 @@
 
 mod common;
 
-use std::net::TcpStream;
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{ClosePoint, FakeSmarthost, ServerResult, SmarthostConfig, TestPki};
 use signed_relay_lite::config::Secret;
-use signed_relay_lite::relay::{DeliveryResult, DeliveryStatus, Envelope};
+use signed_relay_lite::message::{Limits, Message};
+use signed_relay_lite::relay::{DeliveryJob, DeliveryResult, DeliveryStatus, Envelope, RelayPool};
 use signed_relay_lite::smtp::{deliver, SmtpConnection, SmtpStream};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const TLS_TIMEOUT: Duration = Duration::from_millis(300);
+
+struct ScriptedStream {
+    replies: Cursor<Vec<u8>>,
+}
+
+impl Read for ScriptedStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        self.replies.read(buffer)
+    }
+}
+
+impl Write for ScriptedStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn scripted_connection() -> SmtpConnection {
+    SmtpConnection::new("test-client", || {
+        Ok(Box::new(ScriptedStream {
+            replies: Cursor::new(
+                b"220 ready\r\n250 hello\r\n250 sender\r\n250 recipient\r\n354 data\r\n250 queued\r\n"
+                    .to_vec(),
+            ),
+        }) as SmtpStream)
+    })
+}
+
+fn test_message() -> Message {
+    Message::parse(
+        b"From: sender@example.com\r\n\r\nbody\r\n".to_vec(),
+        Limits::testing(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn dropping_relay_pool_joins_idle_workers() {
+    let pool = RelayPool::new(4, 4, scripted_connection);
+    drop(pool);
+}
+
+#[test]
+fn relay_submit_waits_for_real_tcp_final_reply() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (at_final_dot_tx, at_final_dot_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_final_tx, release_final_rx) = std::sync::mpsc::sync_channel(1);
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(b"220 ready\r\n").unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = Vec::new();
+        for reply in [
+            b"250 hello\r\n".as_slice(),
+            b"250 sender\r\n",
+            b"250 recipient\r\n",
+            b"354 data\r\n",
+        ] {
+            line.clear();
+            reader.read_until(b'\n', &mut line).unwrap();
+            stream.write_all(reply).unwrap();
+        }
+        loop {
+            line.clear();
+            reader.read_until(b'\n', &mut line).unwrap();
+            if line == b".\r\n" {
+                break;
+            }
+        }
+        at_final_dot_tx.send(()).unwrap();
+        release_final_rx.recv().unwrap();
+        stream.write_all(b"250 queued\r\n").unwrap();
+    });
+    let pool = Arc::new(RelayPool::new(1, 1, move || {
+        SmtpConnection::new("test-client", move || {
+            let stream = TcpStream::connect(address)?;
+            stream.set_read_timeout(Some(TIMEOUT))?;
+            stream.set_write_timeout(Some(TIMEOUT))?;
+            Ok(Box::new(stream) as SmtpStream)
+        })
+    }));
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+    let submitter = {
+        let pool = Arc::clone(&pool);
+        thread::spawn(move || {
+            let result = pool.submit(test_envelope(), test_message(), b"sig".to_vec());
+            finished_tx.send(result).unwrap();
+        })
+    };
+
+    at_final_dot_rx.recv_timeout(TIMEOUT).unwrap();
+    assert!(finished_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+    release_final_tx.send(()).unwrap();
+    assert!(finished_rx.recv_timeout(TIMEOUT).unwrap().is_accepted());
+    submitter.join().unwrap();
+    drop(pool);
+    server.join().unwrap();
+}
+
+#[test]
+fn four_relay_workers_process_four_submissions_concurrently() {
+    struct BarrierStream {
+        replies: Cursor<Vec<u8>>,
+        start: Arc<Barrier>,
+        first_read: bool,
+    }
+    impl Read for BarrierStream {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.first_read {
+                self.first_read = false;
+                self.start.wait();
+            }
+            self.replies.read(buffer)
+        }
+    }
+    impl Write for BarrierStream {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let start = Arc::new(Barrier::new(4));
+    let pool = Arc::new(RelayPool::new(4, 4, {
+        let start = Arc::clone(&start);
+        move || {
+            let start = Arc::clone(&start);
+            SmtpConnection::new("test-client", move || {
+                Ok(Box::new(BarrierStream {
+                    replies: Cursor::new(
+                        b"220 ready\r\n250 hello\r\n250 sender\r\n250 recipient\r\n354 data\r\n250 queued\r\n"
+                            .to_vec(),
+                    ),
+                    start: Arc::clone(&start),
+                    first_read: true,
+                }) as SmtpStream)
+            })
+        }
+    }));
+    let submissions: Vec<_> = (0..4)
+        .map(|_| {
+            let pool = Arc::clone(&pool);
+            thread::spawn(move || pool.submit(test_envelope(), test_message(), b"sig".to_vec()))
+        })
+        .collect();
+
+    for submission in submissions {
+        assert!(submission.join().unwrap().is_accepted());
+    }
+}
+
+#[test]
+fn bounded_relay_queue_backpressures_above_capacity() {
+    let worker_gate = Arc::new(Barrier::new(2));
+    let pool = Arc::new(RelayPool::new(1, 1, {
+        let worker_gate = Arc::clone(&worker_gate);
+        move || {
+            worker_gate.wait();
+            scripted_connection()
+        }
+    }));
+    let make_job = || {
+        let (result_tx, _result_rx) = std::sync::mpsc::sync_channel(1);
+        DeliveryJob {
+            envelope: test_envelope(),
+            message: test_message(),
+            signature: b"sig".to_vec(),
+            result_tx,
+        }
+    };
+
+    pool.enqueue(make_job()).unwrap();
+    pool.enqueue(make_job()).unwrap();
+
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+    let blocked_submitter = {
+        let pool = Arc::clone(&pool);
+        thread::spawn(move || {
+            let (result_tx, _result_rx) = std::sync::mpsc::sync_channel(1);
+            pool.enqueue(DeliveryJob {
+                envelope: test_envelope(),
+                message: test_message(),
+                signature: b"sig".to_vec(),
+                result_tx,
+            })
+            .unwrap();
+            finished_tx.send(()).unwrap();
+        })
+    };
+    assert!(finished_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+
+    worker_gate.wait();
+    finished_rx.recv_timeout(TIMEOUT).unwrap();
+    blocked_submitter.join().unwrap();
+}
+
+#[test]
+fn panicking_worker_delivery_reports_failure_and_recreates_connection() {
+    let should_panic = Arc::new(AtomicBool::new(true));
+    let pool = RelayPool::new(1, 1, {
+        let should_panic = Arc::clone(&should_panic);
+        move || {
+            if should_panic.swap(false, Ordering::SeqCst) {
+                SmtpConnection::new("test-client", || -> io::Result<SmtpStream> {
+                    panic!("connector panic")
+                })
+            } else {
+                scripted_connection()
+            }
+        }
+    });
+
+    let first = pool.submit(test_envelope(), test_message(), b"sig".to_vec());
+    assert_eq!(first.status, DeliveryStatus::TemporaryFailure);
+    assert!(!first.is_accepted());
+
+    let second = pool.submit(test_envelope(), test_message(), b"sig".to_vec());
+    assert!(second.is_accepted(), "{second:?}");
+}
 
 fn tls_connection(
     server: &FakeSmarthost,
