@@ -23,9 +23,10 @@
 //!   single reply, preventing an infinite continuation sequence from
 //!   growing the result `Vec` without bound.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
+use std::net::TcpStream;
 
-use crate::relay::Envelope;
+use crate::relay::{DeliveryResult, Envelope};
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -304,6 +305,188 @@ pub fn encode_data(message: &[u8]) -> Vec<u8> {
     // Infallible: Vec writes never fail.
     write_data(&mut buf, message).expect("Vec::write_all is infallible");
     buf
+}
+
+// ── Stream trait at the I/O boundary ──────────────────────────────────
+
+/// Combined `Read + Write` trait for SMTP stream objects.
+///
+/// Plaintext construction is test-stage scaffolding; the API is
+/// designed to be adaptable to TLS without a generic framework.
+pub trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
+/// Concrete boxed stream type for SMTP delivery.
+pub type SmtpStream = Box<dyn ReadWrite + Send>;
+
+// ── Delivery state machine ────────────────────────────────────────────
+
+/// Maximum line length for SMTP reply parsing during delivery.
+const DELIVERY_MAX_LINE_LEN: usize = 4096;
+
+/// Deliver one signed message to a smarthost over a plaintext TCP
+/// connection.
+///
+/// # Protocol behaviour
+///
+/// 1. Read `220` greeting.
+/// 2. Send `EHLO <client_name>`; require `250`.
+/// 3. Send `MAIL FROM:<sender>`; require `250`.
+/// 4. Send `RCPT TO:<addr>` per recipient; require all `2xx`.
+/// 5. On any non-`2xx` RCPT, send `RSET` and return without `DATA`.
+/// 6. Send `DATA`; require `354`.
+/// 7. Write `DKIM-Signature: <value>\r\n` followed by the original
+///    message through the dot-stuffing writer.
+/// 8. Return `Delivered` only after the final `2xx` response.
+/// 9. **No `QUIT`** — the caller controls connection shutdown.
+pub fn deliver(
+    stream: TcpStream,
+    client_name: &str,
+    envelope: &Envelope,
+    dkim_signature: &[u8],
+    message: &[u8],
+) -> DeliveryResult {
+    // Split into independent reader / writer halves.
+    let read_stream = stream.try_clone().expect("TcpStream::try_clone failed");
+    let mut reader = io::BufReader::new(read_stream);
+    let mut writer = stream;
+
+    // 1. Read greeting (220).
+    let greeting = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
+        Ok(r) => r,
+        Err(e) => {
+            return DeliveryResult::temporary_failure(format!("greeting read error: {e:?}"), None);
+        }
+    };
+    if greeting.code != 220 {
+        return DeliveryResult::protocol_rejection(
+            format!("expected 220 greeting, got {}", greeting.code),
+            Some(greeting.code),
+        );
+    }
+
+    // 2. EHLO.
+    if let Err(e) = writer.write_all(format!("EHLO {client_name}\r\n").as_bytes()) {
+        return DeliveryResult::temporary_failure(format!("EHLO write error: {e}"), None);
+    }
+    let _ = writer.flush();
+    let ehlo_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
+        Ok(r) => r,
+        Err(e) => {
+            return DeliveryResult::temporary_failure(format!("EHLO read error: {e:?}"), None);
+        }
+    };
+    if ehlo_reply.code != 250 {
+        return DeliveryResult::protocol_rejection(
+            format!("EHLO rejected: {}", ehlo_reply.code),
+            Some(ehlo_reply.code),
+        );
+    }
+
+    // 3. MAIL FROM.
+    if let Err(e) = write_mail_from(&mut writer, envelope) {
+        return DeliveryResult::temporary_failure(format!("MAIL FROM write error: {e}"), None);
+    }
+    let _ = writer.flush();
+    let mail_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
+        Ok(r) => r,
+        Err(e) => {
+            return DeliveryResult::temporary_failure(format!("MAIL FROM read error: {e:?}"), None);
+        }
+    };
+    if mail_reply.code != 250 {
+        return DeliveryResult::protocol_rejection(
+            format!("MAIL FROM rejected: {}", mail_reply.code),
+            Some(mail_reply.code),
+        );
+    }
+
+    // 4. RCPT TO — send all, then check all responses are 2xx.
+    if let Err(e) = write_rcpt_to_list(&mut writer, envelope) {
+        return DeliveryResult::temporary_failure(format!("RCPT TO write error: {e}"), None);
+    }
+    let _ = writer.flush();
+    let mut any_non_2xx = false;
+    let mut first_bad_code: u16 = 0;
+    for _ in envelope.recipients() {
+        let rcpt_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
+            Ok(r) => r,
+            Err(e) => {
+                return DeliveryResult::temporary_failure(
+                    format!("RCPT TO read error: {e:?}"),
+                    None,
+                );
+            }
+        };
+        if rcpt_reply.code >= 300 {
+            any_non_2xx = true;
+            if first_bad_code == 0 {
+                first_bad_code = rcpt_reply.code;
+            }
+        }
+    }
+
+    // 5. On any non-2xx RCPT → RSET, no DATA.
+    if any_non_2xx {
+        let _ = writer.write_all(b"RSET\r\n");
+        let _ = writer.flush();
+        let _ = read_reply(&mut reader, DELIVERY_MAX_LINE_LEN);
+        return DeliveryResult::protocol_rejection(
+            format!("recipient rejected: {first_bad_code}"),
+            Some(first_bad_code),
+        );
+    }
+
+    // 6. DATA — require 354.
+    if let Err(e) = writer.write_all(b"DATA\r\n") {
+        return DeliveryResult::temporary_failure(format!("DATA write error: {e}"), None);
+    }
+    let _ = writer.flush();
+    let data_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
+        Ok(r) => r,
+        Err(e) => {
+            return DeliveryResult::temporary_failure(format!("DATA read error: {e:?}"), None);
+        }
+    };
+    if data_reply.code != 354 {
+        return DeliveryResult::protocol_rejection(
+            format!("DATA rejected: {}", data_reply.code),
+            Some(data_reply.code),
+        );
+    }
+
+    // 7. Write DKIM-Signature header + dot-stuffed message.
+    if writer.write_all(b"DKIM-Signature: ").is_err()
+        || writer.write_all(dkim_signature).is_err()
+        || writer.write_all(b"\r\n").is_err()
+    {
+        return DeliveryResult::temporary_failure("DKIM header write error", None);
+    }
+    if let Err(e) = write_data(&mut writer, message) {
+        return DeliveryResult::temporary_failure(format!("body write error: {e}"), None);
+    }
+    let _ = writer.flush();
+
+    // 8. Read final response — Delivered only after 2xx.
+    let final_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
+        Ok(r) => r,
+        Err(e) => {
+            return DeliveryResult::ambiguous(format!("final response read error: {e:?}"));
+        }
+    };
+    if (200..300).contains(&final_reply.code) {
+        let diag = final_reply
+            .lines
+            .first()
+            .map(|l| String::from_utf8_lossy(l).to_string())
+            .unwrap_or_default();
+        DeliveryResult::delivered(diag, Some(final_reply.code))
+    } else {
+        DeliveryResult::protocol_rejection(
+            format!("final response: {}", final_reply.code),
+            Some(final_reply.code),
+        )
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
