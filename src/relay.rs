@@ -102,6 +102,9 @@ impl RelayPool {
                                 )
                             }
                         };
+                        // The handler releases its memory reservation after receiving this
+                        // result, so drop the retained message before making that possible.
+                        drop(job.message);
                         let _ = job.result_tx.send(result);
                     }
                 })
@@ -158,6 +161,9 @@ impl RelayPool {
                             match factory() {
                                 Ok(replacement) => connection = Some(replacement),
                                 Err(error) => {
+                                    // Keep actual retained bytes within the handler-owned
+                                    // reservation until the message allocation is gone.
+                                    drop(job.message);
                                     let _ = job.result_tx.send(DeliveryResult::temporary_failure(
                                         format!("cannot rebuild SMTP connection: {error}"),
                                         None,
@@ -182,6 +188,9 @@ impl RelayPool {
                                 )
                             }
                         };
+                        // The handler releases its memory reservation after receiving this
+                        // result, so drop the retained message before making that possible.
+                        drop(job.message);
                         let _ = job.result_tx.send(result);
                     }
                 })
