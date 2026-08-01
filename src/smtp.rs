@@ -261,12 +261,19 @@ pub fn write_rcpt_to_list(w: &mut impl Write, envelope: &Envelope) -> io::Result
 ///
 /// # Canonical input assumption
 ///
-/// Retained messages end with `\r\n` (canonical CRLF form).  The
+/// Retained messages end with `\r\n` (canonical CRLF form). The
 /// function adds exactly `.\r\n` after the (possibly stuffed) message
-/// bytes.  If the input lacks a trailing `\r\n`, the terminator still
-/// follows immediately — the caller is responsible for ensuring
-/// canonical framing before calling this function.
+/// bytes. Empty data is accepted; non-empty data without terminal CRLF is
+/// rejected before any bytes are written so the terminator cannot become
+/// part of an unterminated body line.
 pub fn write_data(w: &mut impl Write, message: &[u8]) -> io::Result<()> {
+    if !message.is_empty() && !message.ends_with(b"\r\n") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SMTP DATA must be empty or end with CRLF",
+        ));
+    }
+
     let mut last = 0; // start of the current unwritten span
 
     for i in 0..message.len() {
@@ -518,6 +525,14 @@ mod tests {
     fn canonical_empty_body() {
         // Empty body = just the terminating dot.
         assert_eq!(encode_data(b""), b".\r\n");
+    }
+
+    #[test]
+    fn nonempty_data_without_terminal_crlf_is_rejected() {
+        let mut output = Vec::new();
+        let error = write_data(&mut output, b"unterminated").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(output.is_empty());
     }
 
     #[test]
