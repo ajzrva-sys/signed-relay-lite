@@ -7,13 +7,87 @@
 mod common;
 
 use std::net::TcpStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use common::{ClosePoint, FakeSmarthost, ServerResult, SmarthostConfig};
+use common::{ClosePoint, FakeSmarthost, ServerResult, SmarthostConfig, TestPki};
 use signed_relay_lite::relay::{DeliveryResult, DeliveryStatus, Envelope};
 use signed_relay_lite::smtp::{deliver, SmtpConnection, SmtpStream};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+const TLS_TIMEOUT: Duration = Duration::from_millis(300);
+
+fn tls_connection(
+    server: &FakeSmarthost,
+    hostname: &str,
+    ca_file: Option<&std::path::Path>,
+) -> SmtpConnection {
+    SmtpConnection::new_implicit_tls(
+        "test-client",
+        hostname,
+        server.addr.port(),
+        TLS_TIMEOUT,
+        ca_file,
+    )
+    .expect("construct TLS connector")
+}
+
+fn test_envelope() -> Envelope {
+    Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap()
+}
+
+#[test]
+fn verified_tls_with_trusted_ca_and_matching_hostname_succeeds() {
+    let pki = TestPki::localhost();
+    let server = FakeSmarthost::start_tls(SmarthostConfig::default(), pki.acceptor());
+    let mut connection = tls_connection(&server, "localhost", Some(&pki.ca_file));
+    let result = connection.deliver(&test_envelope(), b"secret-signature", b"secret-body\r\n");
+    drop(connection);
+    let observed = server.join();
+    assert!(result.is_accepted(), "{result:?}");
+    assert_eq!(observed.captured_messages.len(), 1);
+}
+
+#[test]
+fn untrusted_tls_certificate_fails_before_smtp_without_leaking_message() {
+    let pki = TestPki::localhost();
+    let server = FakeSmarthost::start_tls(SmarthostConfig::default(), pki.acceptor());
+    let mut connection = tls_connection(&server, "localhost", None);
+    let result = connection.deliver(&test_envelope(), b"secret-signature", b"secret-body\r\n");
+    drop(connection);
+    let observed = server.join();
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(!result.ambiguous);
+    assert!(observed.commands.is_empty());
+    assert!(observed.captured_message.is_empty());
+}
+
+#[test]
+fn trusted_tls_certificate_with_wrong_hostname_fails() {
+    let pki = TestPki::localhost();
+    let server = FakeSmarthost::start_tls(SmarthostConfig::default(), pki.acceptor());
+    let mut connection = tls_connection(&server, "127.0.0.1", Some(&pki.ca_file));
+    let result = connection.deliver(&test_envelope(), b"secret-signature", b"secret-body\r\n");
+    drop(connection);
+    let observed = server.join();
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(!result.ambiguous);
+    assert!(observed.commands.is_empty());
+}
+
+#[test]
+fn tls_handshake_stall_is_a_bounded_temporary_failure() {
+    let server = FakeSmarthost::start_tls_stall(Duration::from_secs(1));
+    let mut connection = tls_connection(&server, "localhost", None);
+    let started = Instant::now();
+    let result = connection.deliver(&test_envelope(), b"secret-signature", b"secret-body\r\n");
+    let elapsed = started.elapsed();
+    drop(connection);
+    let observed = server.join();
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(!result.ambiguous);
+    assert!(elapsed < Duration::from_millis(900), "elapsed {elapsed:?}");
+    assert!(observed.commands.is_empty());
+}
 
 /// Helper: connect to the server, run deliver(), return both results.
 fn run_delivery(

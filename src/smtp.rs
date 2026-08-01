@@ -24,7 +24,11 @@
 //!   growing the result `Vec` without bound.
 
 use std::io::{self, BufRead, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use openssl::ssl::{HandshakeError, SslConnector, SslMethod, SslVerifyMode};
 
 use crate::relay::{DeliveryResult, Envelope};
 
@@ -464,6 +468,47 @@ impl SmtpConnection {
         }
     }
 
+    /// Create a reusable SMTP connection using verified implicit TLS.
+    ///
+    /// The relay hostname is used for the TCP destination, TLS SNI, and
+    /// certificate hostname verification. System trust roots are always
+    /// loaded. `ca_file` may add an enterprise or test CA, but peer and
+    /// hostname verification cannot be disabled.
+    pub fn new_implicit_tls(
+        client_name: impl Into<String>,
+        relay_host: impl Into<String>,
+        relay_port: u16,
+        timeout: Duration,
+        ca_file: Option<&Path>,
+    ) -> io::Result<Self> {
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "TLS connection timeout must be positive",
+            ));
+        }
+
+        let relay_host = relay_host.into();
+        let ca_file = ca_file.map(PathBuf::from);
+        let mut builder = SslConnector::builder(SslMethod::tls_client())
+            .map_err(|error| tls_io_error("TLS connector", error))?;
+        builder.set_verify(SslVerifyMode::PEER);
+        builder
+            .set_default_verify_paths()
+            .map_err(|error| tls_io_error("system trust store", error))?;
+        if let Some(path) = ca_file {
+            builder
+                .set_ca_file(path)
+                .map_err(|error| tls_io_error("additional CA file", error))?;
+        }
+        let connector = builder.build();
+        let connect_host = relay_host.clone();
+
+        Ok(Self::new(client_name, move || {
+            connect_verified_tls(&connector, &connect_host, relay_port, timeout)
+        }))
+    }
+
     /// Deliver a message, reconnecting at most once when explicit attempt
     /// metadata says no body could have started.
     pub fn deliver(
@@ -516,6 +561,71 @@ impl SmtpConnection {
             dkim_signature,
             message,
         )
+    }
+}
+
+fn connect_verified_tls(
+    connector: &SslConnector,
+    relay_host: &str,
+    relay_port: u16,
+    timeout: Duration,
+) -> io::Result<SmtpStream> {
+    let addresses = (relay_host, relay_port).to_socket_addrs()?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid TLS timeout"))?;
+    let mut last_error = None;
+    let mut tcp = None;
+
+    for address in addresses {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match TcpStream::connect_timeout(&address, remaining) {
+            Ok(stream) => {
+                tcp = Some(stream);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    let tcp = tcp.ok_or_else(|| {
+        last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "TLS TCP connection timed out")
+        })
+    })?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "TLS handshake deadline expired",
+        ));
+    }
+    tcp.set_read_timeout(Some(remaining))?;
+    tcp.set_write_timeout(Some(remaining))?;
+
+    let stream = connector
+        .connect(relay_host, tcp)
+        .map_err(handshake_io_error)?;
+    let tcp = stream.get_ref();
+    tcp.set_read_timeout(Some(timeout))?;
+    tcp.set_write_timeout(Some(timeout))?;
+    Ok(Box::new(stream) as SmtpStream)
+}
+
+fn tls_io_error(context: &str, error: impl std::fmt::Display) -> io::Error {
+    io::Error::other(format!("{context}: {error}"))
+}
+
+fn handshake_io_error(error: HandshakeError<TcpStream>) -> io::Error {
+    match error {
+        HandshakeError::Failure(mid) => tls_io_error("TLS handshake", mid.error()),
+        HandshakeError::WouldBlock(_) => {
+            io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out")
+        }
+        HandshakeError::SetupFailure(error) => tls_io_error("TLS handshake setup", error),
     }
 }
 
