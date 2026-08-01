@@ -50,9 +50,9 @@ All limits are enforced **before** allocating memory for the decoded payload.
 ### Ambiguous delivery and duplication
 
 If the connection to the smarthost drops after `DATA` but before the final
-`250` response, the result is flagged **ambiguous**. Retrying an ambiguous
-submission may deliver the message twice. The daemon does not retry on its
-own; the caller owns that decision.
+acceptance response, the result is flagged **ambiguous**. Retrying an
+ambiguous submission may deliver the message twice. The daemon never retries
+an ambiguous result; the caller owns that decision.
 
 ## Secrets and file permissions
 
@@ -71,6 +71,8 @@ chown signed-relay:signed-relay /etc/signed-relay-lite/mail.pem
 
 * Contains the raw SMTP AUTH password (no trailing-newline stripping is
   performed by the daemon — the file contents are the password).
+  Use `printf %s 'password' > relay-password`; ordinary `echo` usually adds
+  a newline and therefore changes the password.
 * The password is loaded into a `Secret` and the temporary buffer is
   **zeroed immediately** after cloning into the `Secret`.
 * Recommended permissions: `0400`, owned by the daemon's service account.
@@ -111,8 +113,8 @@ When `require_fips=true`:
    (OpenSSL 1.x) via `dlsym(RTLD_DEFAULT, ...)`.
 3. If the kernel says FIPS is enabled but OpenSSL does not confirm it, the
    daemon refuses to start.
-4. On non-Linux platforms, the FIPS check is a no-op (the setting is
-   accepted but not enforced).
+4. A missing Linux status file, an unsupported platform, or an unverifiable
+   OpenSSL mode is an error. The check fails closed.
 
 When `require_fips=false`, no FIPS checks are performed.
 
@@ -124,13 +126,11 @@ If you believe you have found a security vulnerability in signed-relay-lite:
 2. Use **GitHub Private Vulnerability Reporting** if enabled on the
    repository — the "Report a vulnerability" button under the Security tab
    creates a private advisory visible only to maintainers.
-3. If private reporting is not available, email the maintainers directly.
-   (Check the repository's `Cargo.toml` or `AUTHORS` file for contact
-   information.)
+3. If private reporting is not available, use a private maintainer contact
+   channel published on the repository owner's GitHub profile. Do not put
+   vulnerability details in a public issue.
 4. Include a description of the vulnerability, steps to reproduce, and the
    potential impact.
-5. We will acknowledge receipt within 7 days and aim to ship a fix within
-   30 days for confirmed vulnerabilities.
 
 We appreciate coordinated disclosure and will credit reporters in the
 release notes unless they prefer to remain anonymous.

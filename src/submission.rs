@@ -904,6 +904,17 @@ fn process_request(
 ) -> DeliveryResult {
     let request = match read_request(stream, submission_limits, budget) {
         Ok(request) => request,
+        Err(SubmissionError::BudgetExhausted {
+            requested,
+            capacity,
+        }) => {
+            return DeliveryResult::temporary_failure(
+                format!(
+                    "submission memory budget exhausted: requested {requested} bytes, capacity {capacity} bytes"
+                ),
+                None,
+            );
+        }
         Err(error) => {
             return DeliveryResult::protocol_rejection(
                 format!("invalid submission frame: {error:?}"),

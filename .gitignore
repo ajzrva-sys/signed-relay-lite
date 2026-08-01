@@ -1,1 +1,6 @@
 /target
+.DS_Store
+*.key
+*.pem
+*.swp
+HANDOFF.md

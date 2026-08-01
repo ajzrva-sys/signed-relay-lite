@@ -46,7 +46,7 @@ impl Limits {
     }
 }
 
-/// Byte range into the owning [`Message::bytes`].
+/// Byte range into the owning `Message` bytes.
 pub struct HeaderRange {
     pub name: Range<usize>,
     pub value: Range<usize>,

@@ -19,7 +19,7 @@
 //!
 //! * **Per-line**: the `max_line_len` parameter caps each line's content
 //!   (excluding CRLF).  A line of exactly `max_line_len` bytes is accepted.
-//! * **Aggregate**: [`MAX_REPLY_LINES`] caps the number of lines in any
+//! * **Aggregate**: a fixed limit caps the number of lines in any
 //!   single reply, preventing an infinite continuation sequence from
 //!   growing the result `Vec` without bound.
 
@@ -72,7 +72,7 @@ pub enum SmtpError {
     InconsistentCode,
     /// The stream ended before a terminating line was received.
     Eof,
-    /// The number of lines exceeds [`MAX_REPLY_LINES`].
+    /// The number of lines exceeds the fixed aggregate limit.
     TooManyLines,
 }
 
@@ -843,6 +843,7 @@ fn checked_base64(input: &[u8]) -> Result<Vec<u8>, ()> {
 
 fn erase_vec(bytes: &mut Vec<u8>) {
     for byte in bytes.as_mut_slice() {
+        // SAFETY: `byte` is a valid, uniquely borrowed byte in this vector.
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);

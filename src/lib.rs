@@ -8,11 +8,3 @@ pub mod message;
 pub mod relay;
 pub mod smtp;
 pub mod submission;
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}

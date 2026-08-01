@@ -383,7 +383,9 @@ fn budget_is_held_through_worker_completion_and_released_afterward() {
     let mut two = UnixStream::connect(&path.0).unwrap();
     two.write_all(&frame[..body_start]).unwrap();
     let rejected = read_result(&mut two, &limits);
-    assert_ne!(rejected.status, DeliveryStatus::Delivered);
+    assert_eq!(rejected.status, DeliveryStatus::TemporaryFailure);
+    assert!(!rejected.ambiguous);
+    assert!(rejected.diagnostic.contains("memory budget"));
     assert_eq!(observed.used(), first.len());
 
     release.send(()).unwrap();

@@ -5,6 +5,11 @@ edition = "2021"
 rust-version = "1.75"
 license = "Apache-2.0"
 description = "A bounded in-memory DKIM submission relay for a fixed smarthost"
+readme = "README.md"
+repository = "https://github.com/ajzrva-sys/signed-relay-lite"
+homepage = "https://github.com/ajzrva-sys/signed-relay-lite"
+keywords = ["dkim", "smtp", "email", "relay"]
+categories = ["email"]
 
 [dependencies]
 libc = "=0.2.177"

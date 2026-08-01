@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_void};
 use std::fmt;
 use std::fs;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use std::time::Duration;
 /// Configuration for DKIM signing.
 ///
 /// Contains only the essentials for signing: domain, selector, and the RSA
-/// private key wrapped in [`Arc`] for shared ownership across async tasks.
+/// private key wrapped in [`Arc`] for shared ownership across worker threads.
 #[derive(Clone)]
 pub struct SigningConfig {
     /// The signing domain (d= tag). Lowercase, no trailing dot.
@@ -70,6 +70,7 @@ impl Drop for Secret {
 fn erase(bytes: &mut [u8]) {
     // Volatile writes prevent the compiler from optimizing away the erasure.
     for byte in bytes {
+        // SAFETY: `byte` is a valid, uniquely borrowed byte in this slice.
         unsafe { std::ptr::write_volatile(byte, 0) };
     }
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
@@ -219,14 +220,13 @@ impl RuntimeConfig {
             Some(secret)
         };
 
-        let key_bytes = fs::read(&private_key_path).map_err(|error| {
+        let mut key_bytes = fs::read(&private_key_path).map_err(|error| {
             format!(
                 "cannot read private key {}: {error}",
                 private_key_path.display()
             )
         })?;
-        let key = PKey::private_key_from_pem(&key_bytes)
-            .map_err(|error| format!("cannot parse unencrypted PEM private key: {error}"))?;
+        let key = parse_private_key(&mut key_bytes)?;
         validate_key(&key)?;
 
         Ok(Self {
@@ -251,6 +251,12 @@ impl RuntimeConfig {
             require_fips,
         })
     }
+}
+
+fn parse_private_key(key_bytes: &mut [u8]) -> Result<PKey<Private>, String> {
+    let parsed = PKey::private_key_from_pem(key_bytes);
+    erase(key_bytes);
+    parsed.map_err(|error| format!("cannot parse unencrypted PEM private key: {error}"))
 }
 
 fn absolute_path(name: &str, value: &str) -> Result<PathBuf, String> {
@@ -338,36 +344,37 @@ pub fn check_fips_environment(required: bool) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         let path = Path::new("/proc/sys/crypto/fips_enabled");
-        match fs::read_to_string(path) {
-            Ok(value) if value.trim() == "1" => {
-                return if openssl_fips_enabled() {
-                    Ok(())
-                } else {
-                    Err(
-                        "kernel FIPS mode is enabled but system OpenSSL is not in FIPS mode"
-                            .to_owned(),
-                    )
-                };
-            }
-            Ok(value) if value.trim() == "0" => {
-                return Err("system FIPS mode is disabled".to_owned())
-            }
-            Ok(value) => {
-                return Err(format!(
-                    "unexpected FIPS status in {}: {value:?}",
-                    path.display()
-                ))
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(format!("cannot inspect {}: {error}", path.display())),
-        }
+        return evaluate_linux_fips_status(fs::read_to_string(path), openssl_fips_enabled());
     }
 
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    Err("FIPS mode cannot be verified on this platform".to_owned())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn evaluate_linux_fips_status(
+    status: io::Result<String>,
+    openssl_enabled: bool,
+) -> Result<(), String> {
+    match status {
+        Ok(value) if value.trim() == "1" && openssl_enabled => Ok(()),
+        Ok(value) if value.trim() == "1" => {
+            Err("kernel FIPS mode is enabled but system OpenSSL is not in FIPS mode".to_owned())
+        }
+        Ok(value) if value.trim() == "0" => Err("system FIPS mode is disabled".to_owned()),
+        Ok(value) => Err(format!(
+            "unexpected FIPS status in /proc/sys/crypto/fips_enabled: {value:?}"
+        )),
+        Err(error) => Err(format!(
+            "cannot inspect /proc/sys/crypto/fips_enabled: {error}"
+        )),
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn openssl_fips_enabled() -> bool {
+    // SAFETY: the symbol names are NUL-terminated, looked up in the current
+    // process, checked for null, and called with their documented OpenSSL ABI.
     unsafe {
         let symbol = libc::dlsym(
             libc::RTLD_DEFAULT,
@@ -660,6 +667,25 @@ mod tests {
         let mut bytes = b"top-secret".to_vec();
         erase(&mut bytes);
         assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn private_key_pem_buffer_is_erased_even_when_parsing_fails() {
+        let mut bytes = b"not a private key".to_vec();
+        assert!(parse_private_key(&mut bytes).is_err());
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn missing_linux_fips_status_is_rejected() {
+        let missing = io::Error::new(io::ErrorKind::NotFound, "missing procfs status");
+        assert!(evaluate_linux_fips_status(Err(missing), false).is_err());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn required_fips_is_rejected_when_platform_cannot_verify_it() {
+        assert!(check_fips_environment(true).is_err());
     }
 
     #[test]

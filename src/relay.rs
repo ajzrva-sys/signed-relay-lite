@@ -29,7 +29,7 @@ const MAX_DIAGNOSTIC_BYTES: usize = 4096;
 
 /// Outcome of a single delivery attempt.
 ///
-/// `diagnostic` is bounded to [`MAX_DIAGNOSTIC_BYTES`] bytes, truncated
+/// `diagnostic` is bounded to 4096 bytes, truncated
 /// at the nearest UTF-8 character boundary <= that limit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeliveryResult {
@@ -350,7 +350,7 @@ pub enum EnvelopeError {
     NoRecipients,
     /// A recipient address is empty (zero-length bare addr-spec).
     EmptyRecipientAddress,
-    /// Too many recipients (exceeds [`MAX_RECIPIENTS`]).
+    /// Too many recipients (exceeds the 100-recipient limit).
     TooManyRecipients(usize),
 }
 

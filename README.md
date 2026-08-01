@@ -15,10 +15,10 @@ it, and relay it to exactly one preconfigured smarthost over implicit TLS.
 |---|---|
 | **Single smarthost** | All mail is delivered to `relay_host:relay_port`. No routing, no MX lookups, no queue directories. |
 | **No disk queue** | Messages live only in process memory. If the daemon exits, undelivered messages are lost. |
-| **Caller owns retries** | The submitter (the `signed-relay-sendmail` client or any SRL1-speaking program) is responsible for retrying on transient failure. The daemon does not retry on its own. |
-| **Local success = upstream 2xx** | An exit code of `EX_OK` (0) from `signed-relay-sendmail` means the remote smarthost returned a final `250` after the message dot. This is a stronger guarantee than "accepted into a local queue." |
-| **Ambiguous failures may duplicate** | If the connection drops after `DATA` but before the final `250`, the result is marked *ambiguous*. Retrying an ambiguous submission may deliver the message twice. Callers must be prepared for this. |
-| **Bounded memory** | `global_message_memory_bytes` caps the total memory held by in-flight messages. New submissions block (and eventually time out) when the budget is exhausted. Per-message size is bounded by `max_message_bytes`. |
+| **Caller owns retries** | The submitter (the `signed-relay-sendmail` client or any SRL1-speaking program) is responsible for retrying reported transient failures. The daemon may reconnect once after a transport failure proven to occur before `DATA`; it never retries after `DATA` is accepted or body transmission begins. |
+| **Local success = upstream 2xx** | An exit code of `EX_OK` (0) from `signed-relay-sendmail` means the remote smarthost returned a final `2xx` after the message terminator. This is a stronger guarantee than "accepted into a local queue." |
+| **Ambiguous failures may duplicate** | If the connection drops after `DATA` but before the final acceptance reply, the result is marked *ambiguous*. Retrying an ambiguous submission may deliver the message twice. Callers must be prepared for this. |
+| **Bounded memory** | `global_message_memory_bytes` caps retained bytes for in-flight messages. A submission that cannot reserve its declared message size receives a temporary failure. Per-message size is bounded by `max_message_bytes`. |
 | **TLS always verified** | Certificate verification (`SslVerifyMode::PEER`) is hardcoded and cannot be disabled. |
 | **No SMTPUTF8** | v0.1 does not advertise or support the `SMTPUTF8` SMTP extension. International addresses must be encoded with the standards that predate it. |
 
@@ -60,8 +60,11 @@ cargo build
 # Release build (thin LTO, single codegen unit, symbols stripped)
 cargo build --release
 
-# Run tests
-cargo test
+# Required release gates
+cargo fmt --all -- --check
+cargo test --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --release --locked
 ```
 
 Requires Rust ≥ 1.75 and a system OpenSSL (libssl-dev / openssl-devel).
@@ -80,7 +83,7 @@ cargo fuzz run message
 cargo fuzz run smtp_response
 ```
 
-Corpus seeds are checked in under `fuzz/corpus/`.
+Fuzz corpora are generated locally under the ignored `fuzz/corpus/` directory.
 
 ## Configuration
 
@@ -113,9 +116,9 @@ See [`example.conf`](example.conf) for a fully commented template.
 | `max_message_bytes` | usize | Per-message size limit in bytes (default example: 25 MiB). |
 | `global_message_memory_bytes` | usize | Total in-flight message memory cap. Must be ≥ `max_message_bytes`. |
 | `max_concurrent_submissions` | usize | Maximum simultaneous submission handlers. |
-| `submission_timeout_seconds` | u64 | Timeout for a single submission connection. |
-| `delivery_timeout_seconds` | u64 | Timeout for the upstream SMTP delivery. |
-| `require_fips` | bool | `true` or `false`. When `true`, startup fails unless FIPS mode is active (Linux only; checks `/proc/sys/crypto/fips_enabled` and the OpenSSL FIPS flag). |
+| `submission_timeout_seconds` | u64 | Inactivity timeout applied to submission socket reads and writes. |
+| `delivery_timeout_seconds` | u64 | Connection and per-I/O inactivity timeout for upstream SMTP. |
+| `require_fips` | bool | `true` or `false`. When `true`, startup fails unless Linux kernel FIPS status and the loaded OpenSSL FIPS mode can both be verified. Unsupported platforms and missing status fail closed. |
 
 ## DKIM provenance
 

@@ -161,6 +161,8 @@ fn smtp_connection(config: &RuntimeConfig) -> std::io::Result<SmtpConnection> {
 }
 
 fn install_signal_handlers() -> Result<(), String> {
+    // SAFETY: `install_signal` initializes a complete `sigaction` structure
+    // and installs only the async-signal-safe `on_shutdown` handler.
     unsafe {
         if install_signal(libc::SIGTERM) || install_signal(libc::SIGINT) {
             return Err("cannot install signal handlers".to_owned());
@@ -170,6 +172,8 @@ fn install_signal_handlers() -> Result<(), String> {
 }
 
 unsafe fn install_signal(signal: libc::c_int) -> bool {
+    // SAFETY: zero is a valid initial representation for `sigaction`; all
+    // required fields are populated before the structure is passed to libc.
     let mut action: libc::sigaction = std::mem::zeroed();
     action.sa_sigaction = on_shutdown as *const () as libc::sighandler_t;
     libc::sigemptyset(&mut action.sa_mask);
