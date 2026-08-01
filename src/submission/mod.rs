@@ -1,4 +1,4 @@
-//! Strict bounded SRL1 submission protocol and Unix-domain server.
+//! Strict bounded submission codecs and SRL2 Unix-domain server.
 
 mod budget;
 mod protocol;
@@ -12,4 +12,4 @@ pub use protocol::{
     ServerReply, SubmissionError, SubmissionLimits, SubmissionRequest, FINAL_KIND, MAX_CHUNK_BYTES,
     READY_KIND,
 };
-pub use server::SubmissionServer;
+pub use server::{SubmissionServer, SubmissionServerConfig};

@@ -15,7 +15,8 @@ use signed_relay_lite::message::Limits as MessageLimits;
 use signed_relay_lite::relay::{DeliveryResult, DeliveryStatus, RelayPool};
 use signed_relay_lite::smtp::{SmtpConnection, SmtpStream};
 use signed_relay_lite::submission::{
-    read_request, read_response, MemoryBudget, SubmissionLimits, SubmissionServer,
+    read_request, read_server_reply, MemoryBudget, ServerReply, SubmissionLimits, SubmissionServer,
+    SubmissionServerConfig,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
@@ -61,10 +62,12 @@ fn submission_limits() -> SubmissionLimits {
 fn bind(path: &Path, mode: u32, shutdown: Arc<AtomicBool>) -> io::Result<SubmissionServer> {
     SubmissionServer::bind(
         path,
-        mode,
-        Duration::from_millis(150),
-        2,
-        submission_limits(),
+        SubmissionServerConfig {
+            max_message_bytes: 26_214_400,
+            submission_timeout: Duration::from_millis(150),
+            max_active_handlers: 2,
+            socket_mode: mode,
+        },
         MessageLimits::testing(),
         MemoryBudget::new(1024 * 1024),
         signing(),
@@ -76,16 +79,171 @@ fn bind(path: &Path, mode: u32, shutdown: Arc<AtomicBool>) -> io::Result<Submiss
 fn request(message: &[u8]) -> Vec<u8> {
     let sender = b"sender@example.com";
     let recipient = b"recipient@example.net";
-    let mut bytes = b"SRL1".to_vec();
+    let mut bytes = b"SRL2".to_vec();
     bytes.extend_from_slice(&0_u32.to_be_bytes());
     bytes.extend_from_slice(&(sender.len() as u32).to_be_bytes());
     bytes.extend_from_slice(sender);
     bytes.extend_from_slice(&1_u32.to_be_bytes());
     bytes.extend_from_slice(&(recipient.len() as u32).to_be_bytes());
     bytes.extend_from_slice(recipient);
-    bytes.extend_from_slice(&(message.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(&(message.len() as u32).to_be_bytes());
     bytes.extend_from_slice(message);
+    bytes.extend_from_slice(&0_u32.to_be_bytes());
     bytes
+}
+
+fn envelope() -> Vec<u8> {
+    let frame = request(&[]);
+    frame[..frame.len() - 8].to_vec()
+}
+
+#[test]
+fn valid_envelope_receives_ready_before_message_bytes_are_read() {
+    let path = TestPath::new();
+    let limits = submission_limits();
+    let Some((shutdown, server)) = start_server(
+        &path.0,
+        Duration::from_secs(1),
+        1,
+        limits,
+        MemoryBudget::new(1024),
+        relay_pool(),
+    ) else {
+        return;
+    };
+    let mut client = UnixStream::connect(&path.0).unwrap();
+    client.write_all(&envelope()).unwrap();
+    assert!(matches!(
+        read_server_reply(&mut client).unwrap(),
+        ServerReply::Ready(_)
+    ));
+    drop(client);
+    stop_server(shutdown, server);
+}
+
+#[test]
+fn ready_advertises_runtime_max_message_bytes() {
+    let path = TestPath::new();
+    let mut limits = submission_limits();
+    limits.max_message_bytes = 73;
+    let Some((shutdown, server)) = start_server(
+        &path.0,
+        Duration::from_secs(1),
+        1,
+        limits,
+        MemoryBudget::new(1024),
+        relay_pool(),
+    ) else {
+        return;
+    };
+    let mut client = UnixStream::connect(&path.0).unwrap();
+    client.write_all(&envelope()).unwrap();
+    let ServerReply::Ready(ready) = read_server_reply(&mut client).unwrap() else {
+        panic!("valid envelope did not receive READY");
+    };
+    assert_eq!(ready.max_message_bytes, 73);
+    drop(client);
+    stop_server(shutdown, server);
+}
+
+#[test]
+fn invalid_envelope_receives_final_without_ready() {
+    let path = TestPath::new();
+    let Some((shutdown, server)) = start_server(
+        &path.0,
+        Duration::from_secs(1),
+        1,
+        submission_limits(),
+        MemoryBudget::new(1024),
+        relay_pool(),
+    ) else {
+        return;
+    };
+    let mut client = UnixStream::connect(&path.0).unwrap();
+    client.write_all(b"NOPE").unwrap();
+    let ServerReply::Final(result) = read_server_reply(&mut client).unwrap() else {
+        panic!("invalid envelope received READY");
+    };
+    assert_eq!(result.status, DeliveryStatus::ProtocolRejection);
+    assert!(!result.ambiguous);
+    stop_server(shutdown, server);
+}
+
+#[test]
+fn exact_advertised_message_limit_reaches_signing_worker() {
+    let path = TestPath::new();
+    let message = b"From: sender@example.com\r\n\r\nbody\r\n";
+    let mut limits = submission_limits();
+    limits.max_message_bytes = message.len() as u64;
+    let (relay, captured, release, peer) = gated_relay(b"250 exact\r\n");
+    let Some((shutdown, server)) = start_server(
+        &path.0,
+        Duration::from_secs(1),
+        1,
+        limits.clone(),
+        MemoryBudget::new(message.len()),
+        relay,
+    ) else {
+        return;
+    };
+    let mut client = UnixStream::connect(&path.0).unwrap();
+    client.write_all(&request(message)).unwrap();
+    let signed = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(signed.ends_with(message));
+    release.send(()).unwrap();
+    assert_eq!(
+        read_result(&mut client, &limits).status,
+        DeliveryStatus::Delivered
+    );
+    stop_server(shutdown, server);
+    peer.join().unwrap();
+}
+
+#[test]
+fn advertised_limit_plus_one_is_rejected_before_smtp() {
+    let path = TestPath::new();
+    let message = b"From: sender@example.com\r\n\r\nbody\r\n";
+    let mut limits = submission_limits();
+    limits.max_message_bytes = (message.len() - 1) as u64;
+    let Some((shutdown, server)) = start_server(
+        &path.0,
+        Duration::from_secs(1),
+        1,
+        limits.clone(),
+        MemoryBudget::new(message.len()),
+        relay_pool(),
+    ) else {
+        return;
+    };
+    let mut client = UnixStream::connect(&path.0).unwrap();
+    client.write_all(&request(message)).unwrap();
+    let result = read_result(&mut client, &limits);
+    assert_eq!(result.status, DeliveryStatus::ProtocolRejection);
+    assert!(!result.ambiguous);
+    stop_server(shutdown, server);
+}
+
+#[test]
+fn old_srl1_client_is_rejected_without_delivery() {
+    let path = TestPath::new();
+    let Some((shutdown, server)) = start_server(
+        &path.0,
+        Duration::from_secs(1),
+        1,
+        submission_limits(),
+        MemoryBudget::new(1024),
+        relay_pool(),
+    ) else {
+        return;
+    };
+    let mut client = UnixStream::connect(&path.0).unwrap();
+    client.write_all(b"SRL1").unwrap();
+    let ServerReply::Final(result) = read_server_reply(&mut client).unwrap() else {
+        panic!("SRL1 received READY");
+    };
+    assert_eq!(result.status, DeliveryStatus::ProtocolRejection);
+    assert!(!result.ambiguous);
+    stop_server(shutdown, server);
 }
 
 #[test]
@@ -110,10 +268,12 @@ fn start_server(
     let shutdown = Arc::new(AtomicBool::new(false));
     let server = match SubmissionServer::bind(
         path,
-        0o660,
-        timeout,
-        handlers,
-        limits,
+        SubmissionServerConfig {
+            max_message_bytes: limits.max_message_bytes as usize,
+            submission_timeout: timeout,
+            max_active_handlers: handlers,
+            socket_mode: 0o660,
+        },
         MessageLimits::testing(),
         budget,
         signing(),
@@ -210,7 +370,14 @@ fn read_result(stream: &mut UnixStream, limits: &SubmissionLimits) -> DeliveryRe
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    read_response(stream, limits).unwrap()
+    let _ = limits;
+    match read_server_reply(stream).unwrap() {
+        ServerReply::Final(result) => result,
+        ServerReply::Ready(_) => match read_server_reply(stream).unwrap() {
+            ServerReply::Final(result) => result,
+            ServerReply::Ready(_) => panic!("server sent READY twice"),
+        },
+    }
 }
 
 #[test]
@@ -280,7 +447,7 @@ fn run_accepts_a_client_and_shutdown_removes_own_socket() {
     std::io::Write::write_all(&mut stream, b"SRL1").unwrap();
     let mut response = [0_u8; 4];
     std::io::Read::read_exact(&mut stream, &mut response).unwrap();
-    assert_eq!(&response, b"SRL1");
+    assert_eq!(&response, b"SRL2");
     shutdown.store(true, Ordering::Release);
     handle.join().unwrap();
     assert!(!path.0.exists());
@@ -322,6 +489,10 @@ fn valid_request_waits_for_worker_and_returns_exact_final_result_with_signed_ori
         b"From: sender@example.com\r\nTo: recipient@example.net\r\nSubject: exact\r\n\r\nbody\r\n";
     let mut client = UnixStream::connect(&path.0).unwrap();
     client.write_all(&request(original)).unwrap();
+    assert!(matches!(
+        read_server_reply(&mut client).unwrap(),
+        ServerReply::Ready(_)
+    ));
     client
         .set_read_timeout(Some(Duration::from_millis(100)))
         .unwrap();
@@ -342,34 +513,50 @@ fn valid_request_waits_for_worker_and_returns_exact_final_result_with_signed_ori
 }
 
 #[test]
-fn slow_truncated_client_times_out_with_bounded_non_delivered_outcome() {
+fn truncated_chunk_times_out_and_releases_handler_and_budget() {
     let path = TestPath::new();
     let limits = submission_limits();
+    let budget = MemoryBudget::new(1024);
+    let observed = budget.clone();
     let Some((shutdown, server)) = start_server(
         &path.0,
         Duration::from_millis(80),
         1,
         limits.clone(),
-        MemoryBudget::new(1024),
+        budget,
         relay_pool(),
     ) else {
         return;
     };
     let mut client = UnixStream::connect(&path.0).unwrap();
-    client.write_all(b"SRL1").unwrap();
+    client.write_all(&envelope()).unwrap();
+    assert!(matches!(
+        read_server_reply(&mut client).unwrap(),
+        ServerReply::Ready(_)
+    ));
+    client.write_all(&8_u32.to_be_bytes()).unwrap();
+    client.write_all(b"abc").unwrap();
     let started = std::time::Instant::now();
     let result = read_result(&mut client, &limits);
     assert!(
         started.elapsed() >= Duration::from_millis(40),
         "truncated client was rejected before the configured read timeout"
     );
-    assert_ne!(result.status, DeliveryStatus::Delivered);
+    assert_eq!(result.status, DeliveryStatus::ProtocolRejection);
+    assert!(!result.ambiguous);
     assert!(result.diagnostic.len() <= limits.max_diagnostic_bytes);
+    assert_eq!(observed.used(), 0);
+
+    let mut next = UnixStream::connect(&path.0).unwrap();
+    next.write_all(b"SRL1").unwrap();
+    let ServerReply::Final(_) = read_server_reply(&mut next).unwrap() else {
+        panic!("released handler did not serve the next client");
+    };
     stop_server(shutdown, server);
 }
 
 #[test]
-fn budget_is_held_through_worker_completion_and_released_afterward() {
+fn budget_exhaustion_mid_stream_is_temporary_and_unambiguous() {
     let path = TestPath::new();
     let limits = submission_limits();
     let first = b"From: a@example.com\r\n\r\n1234567890\r\n";
@@ -394,7 +581,7 @@ fn budget_is_held_through_worker_completion_and_released_afterward() {
     assert_eq!(observed.used(), first.len());
 
     let frame = request(second);
-    let body_start = frame.len() - second.len();
+    let body_start = frame.len() - second.len() - 4;
     let mut two = UnixStream::connect(&path.0).unwrap();
     two.write_all(&frame[..body_start]).unwrap();
     let rejected = read_result(&mut two, &limits);
@@ -459,7 +646,7 @@ fn max_active_handlers_bounds_gated_clients() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     second.read_exact(&mut magic).unwrap();
-    assert_eq!(&magic, b"SRL1");
+    assert_eq!(&magic, b"SRL2");
     stop_server(shutdown, server);
     peer.join().unwrap();
 }
@@ -467,8 +654,7 @@ fn max_active_handlers_bounds_gated_clients() {
 #[test]
 fn parse_and_frame_failures_are_bounded_and_never_delivered() {
     let path = TestPath::new();
-    let mut limits = submission_limits();
-    limits.max_diagnostic_bytes = 32;
+    let limits = submission_limits();
     let Some((shutdown, server)) = start_server(
         &path.0,
         Duration::from_millis(200),
@@ -488,7 +674,7 @@ fn parse_and_frame_failures_are_bounded_and_never_delivered() {
         client.write_all(bytes).unwrap();
         let result = read_result(&mut client, &limits);
         assert_ne!(result.status, DeliveryStatus::Delivered);
-        assert!(result.diagnostic.len() <= 32);
+        assert!(result.diagnostic.len() <= limits.max_diagnostic_bytes);
     }
     stop_server(shutdown, server);
 }
@@ -576,10 +762,12 @@ fn rejects_zero_timeout_zero_mode_and_special_mode_bits() {
     let make = |mode, timeout| {
         SubmissionServer::bind(
             &path.0,
-            mode,
-            timeout,
-            1,
-            submission_limits(),
+            SubmissionServerConfig {
+                max_message_bytes: 26_214_400,
+                submission_timeout: timeout,
+                max_active_handlers: 1,
+                socket_mode: mode,
+            },
             MessageLimits::testing(),
             MemoryBudget::new(1),
             signing(),

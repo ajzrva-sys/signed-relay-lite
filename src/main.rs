@@ -4,7 +4,7 @@ use signed_relay_lite::config::{check_fips_environment, RuntimeConfig};
 use signed_relay_lite::message::Limits as MessageLimits;
 use signed_relay_lite::relay::RelayPool;
 use signed_relay_lite::smtp::SmtpConnection;
-use signed_relay_lite::submission::{MemoryBudget, SubmissionLimits, SubmissionServer};
+use signed_relay_lite::submission::{MemoryBudget, SubmissionServer, SubmissionServerConfig};
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -96,16 +96,17 @@ fn run_daemon(path: PathBuf) -> Result<(), String> {
         .map_err(|error| format!("cannot initialize relay workers: {error}"))?,
     );
 
-    let submission_limits = SubmissionLimits::production(config.max_message_bytes as u64);
     let message_limits = MessageLimits::production(config.max_message_bytes);
     install_signal_handlers()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let server = SubmissionServer::bind(
         &config.listen,
-        0o660,
-        config.submission_timeout,
-        config.max_concurrent_submissions,
-        submission_limits,
+        SubmissionServerConfig {
+            max_message_bytes: config.max_message_bytes,
+            submission_timeout: config.submission_timeout,
+            max_active_handlers: config.max_concurrent_submissions,
+            socket_mode: 0o660,
+        },
         message_limits,
         MemoryBudget::new(config.global_message_memory_bytes),
         config.signing.clone(),

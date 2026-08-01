@@ -22,8 +22,9 @@ use signed_relay_lite::relay::{
 };
 use signed_relay_lite::smtp::{read_reply, SmtpConnection, SmtpError, SmtpStream};
 use signed_relay_lite::submission::{
-    read_chunk_stream, read_request, read_response, write_response, MemoryBudget, SubmissionError,
-    SubmissionLimits, SubmissionServer,
+    read_chunk_stream, read_request, read_response, read_server_reply, write_response,
+    MemoryBudget, ServerReply, SubmissionError, SubmissionLimits, SubmissionServer,
+    SubmissionServerConfig,
 };
 
 const DEADLINE: Duration = Duration::from_secs(2);
@@ -512,12 +513,11 @@ fn start_submission(
     let shutdown = Arc::new(AtomicBool::new(false));
     let server = SubmissionServer::bind(
         &path.0,
-        0o600,
-        timeout,
-        handlers,
-        SubmissionLimits {
+        SubmissionServerConfig {
             max_message_bytes: 1024,
-            ..limits()
+            submission_timeout: timeout,
+            max_active_handlers: handlers,
+            socket_mode: 0o600,
         },
         Limits::testing(),
         budget,
@@ -536,12 +536,26 @@ fn stop_submission(shutdown: Arc<AtomicBool>, handle: thread::JoinHandle<()>) {
 
 fn valid_submission() -> Vec<u8> {
     let message = b"From: a@example.com\r\n\r\nbody\r\n";
-    let mut out = frame_prefix(1);
+    let mut out = b"SRL2".to_vec();
+    out.extend(0_u32.to_be_bytes());
+    out.extend(0_u32.to_be_bytes());
+    out.extend(1_u32.to_be_bytes());
     out.extend(3_u32.to_be_bytes());
     out.extend(b"r@b");
-    out.extend((message.len() as u64).to_be_bytes());
+    out.extend((message.len() as u32).to_be_bytes());
     out.extend(message);
+    out.extend(0_u32.to_be_bytes());
     out
+}
+
+fn read_submission_result(stream: &mut UnixStream) -> DeliveryResult {
+    match read_server_reply(stream).unwrap() {
+        ServerReply::Ready(_) => match read_server_reply(stream).unwrap() {
+            ServerReply::Final(result) => result,
+            ServerReply::Ready(_) => panic!("server sent READY twice"),
+        },
+        ServerReply::Final(result) => result,
+    }
 }
 
 fn read_smtp_line(io: &mut BufReader<UnixStream>) -> io::Result<Vec<u8>> {
@@ -636,12 +650,12 @@ fn unix_submission_server_enforces_one_real_handler_until_gated_handler_releases
     );
     release_tx.send(()).unwrap();
     assert_eq!(
-        read_response(&mut first, &limits()).unwrap().status,
+        read_submission_result(&mut first).status,
         DeliveryStatus::Delivered
     );
     assert_eq!(captured_rx.recv_timeout(DEADLINE).unwrap().0, 1);
     assert_eq!(
-        read_response(&mut second, &limits()).unwrap().status,
+        read_submission_result(&mut second).status,
         DeliveryStatus::Delivered
     );
     stop_submission(shutdown, server);
@@ -670,7 +684,7 @@ fn stalled_and_disconnected_mid_frame_release_submission_handler_and_memory_for_
     let split = frame.len() - 5;
     stalled.write_all(&frame[..split]).unwrap();
     let start = Instant::now();
-    let rejected = read_response(&mut stalled, &limits()).unwrap();
+    let rejected = read_submission_result(&mut stalled);
     assert!(start.elapsed() < DEADLINE);
     assert_eq!(rejected.status, DeliveryStatus::ProtocolRejection);
     drop(stalled);
@@ -678,7 +692,7 @@ fn stalled_and_disconnected_mid_frame_release_submission_handler_and_memory_for_
     let mut next = UnixStream::connect(&path.0).unwrap();
     next.set_read_timeout(Some(DEADLINE)).unwrap();
     next.write_all(&frame).unwrap();
-    let completed = read_response(&mut next, &limits()).unwrap();
+    let completed = read_submission_result(&mut next);
     assert_eq!(completed.status, DeliveryStatus::TemporaryFailure);
     assert_eq!(
         budget.used(),

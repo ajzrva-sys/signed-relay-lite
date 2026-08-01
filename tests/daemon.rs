@@ -210,7 +210,7 @@ fn sigterm_stops_daemon_and_removes_socket() {
 }
 
 #[test]
-fn shutdown_never_marks_partial_submission_delivered() {
+fn shutdown_never_converts_partial_srl2_stream_to_success() {
     let fixture = Fixture::new();
     if !unix_sockets_available(&fixture) {
         return;
@@ -223,12 +223,12 @@ fn shutdown_never_marks_partial_submission_delivered() {
     wait_for_socket(&fixture.socket, &mut child);
     let mut client = UnixStream::connect(&fixture.socket).unwrap();
     client.set_read_timeout(Some(TIMEOUT)).unwrap();
-    client.write_all(b"SRL1").unwrap();
+    client.write_all(b"SRL2").unwrap();
     terminate(&child);
     let mut response = Vec::new();
     let _ = client.read_to_end(&mut response);
     if response.len() >= 5 {
-        assert_eq!(&response[..4], b"SRL1");
+        assert_eq!(&response[..4], b"SRL2");
         assert_ne!(response[4], 0, "shutdown fabricated Delivered");
     }
     assert!(wait_output(child).status.success());

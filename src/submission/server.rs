@@ -11,19 +11,31 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::budget::MemoryBudget;
-use super::protocol::{read_request, write_response, SubmissionError, SubmissionLimits};
+use super::protocol::{
+    read_chunk_stream, read_envelope_preamble, write_final_result, write_server_reply, Ready,
+    ServerReply, SubmissionError, MAX_CHUNK_BYTES,
+};
 use crate::config::SigningConfig;
 use crate::message::{Limits as MessageLimits, Message};
 use crate::relay::{DeliveryJob, DeliveryResult, RelayPool};
 
-/// Synchronous, bounded SRL1 server on a Unix-domain socket.
+/// Runtime policy for the synchronous SRL2 submission server.
+#[derive(Clone, Copy, Debug)]
+pub struct SubmissionServerConfig {
+    pub max_message_bytes: usize,
+    pub submission_timeout: Duration,
+    pub max_active_handlers: usize,
+    pub socket_mode: u32,
+}
+
+/// Synchronous, bounded SRL2 server on a Unix-domain socket.
 pub struct SubmissionServer {
     listener: UnixListener,
     path: PathBuf,
     created: SocketIdentity,
     timeout: Duration,
     slots: Arc<HandlerSlots>,
-    submission_limits: Arc<SubmissionLimits>,
+    max_message_bytes: usize,
     message_limits: Arc<MessageLimits>,
     budget: MemoryBudget,
     signing: SigningConfig,
@@ -97,13 +109,9 @@ impl HandlerSlots {
 
 impl SubmissionServer {
     /// Bind a server after applying conservative existing-path safety checks.
-    #[allow(clippy::too_many_arguments)]
     pub fn bind(
         path: impl AsRef<Path>,
-        socket_mode: u32,
-        submission_timeout: Duration,
-        max_active_handlers: usize,
-        submission_limits: SubmissionLimits,
+        config: SubmissionServerConfig,
         message_limits: MessageLimits,
         budget: MemoryBudget,
         signing: SigningConfig,
@@ -117,19 +125,19 @@ impl SubmissionServer {
                 "submission socket path must be absolute",
             ));
         }
-        if max_active_handlers == 0 {
+        if config.max_active_handlers == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "max active handlers must be positive",
             ));
         }
-        if submission_timeout.is_zero() {
+        if config.submission_timeout.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "submission timeout must be positive",
             ));
         }
-        if socket_mode == 0 || socket_mode & !0o777 != 0 {
+        if config.socket_mode == 0 || config.socket_mode & !0o777 != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "socket mode contains non-permission bits",
@@ -146,7 +154,9 @@ impl SubmissionServer {
             ));
         }
         let created = SocketIdentity::from(&metadata);
-        if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(socket_mode)) {
+        if let Err(error) =
+            fs::set_permissions(path, fs::Permissions::from_mode(config.socket_mode))
+        {
             remove_socket_if_identity(path, created);
             return Err(error);
         }
@@ -166,13 +176,13 @@ impl SubmissionServer {
             listener,
             path: path.to_owned(),
             created,
-            timeout: submission_timeout,
+            timeout: config.submission_timeout,
             slots: Arc::new(HandlerSlots {
                 active: Mutex::new(0),
                 changed: Condvar::new(),
-                maximum: max_active_handlers,
+                maximum: config.max_active_handlers,
             }),
-            submission_limits: Arc::new(submission_limits),
+            max_message_bytes: config.max_message_bytes,
             message_limits: Arc::new(message_limits),
             budget,
             signing,
@@ -196,7 +206,7 @@ impl SubmissionServer {
                         break;
                     };
                     let timeout = self.timeout;
-                    let submission_limits = Arc::clone(&self.submission_limits);
+                    let max_message_bytes = self.max_message_bytes;
                     let message_limits = Arc::clone(&self.message_limits);
                     let budget = self.budget.clone();
                     let signing = self.signing.clone();
@@ -208,7 +218,7 @@ impl SubmissionServer {
                             handle_stream(
                                 stream,
                                 timeout,
-                                &submission_limits,
+                                max_message_bytes,
                                 &message_limits,
                                 &budget,
                                 &signing,
@@ -326,7 +336,7 @@ fn reap_finished_handlers(handlers: &mut Vec<JoinHandle<()>>) {
 fn handle_stream(
     mut stream: UnixStream,
     timeout: Duration,
-    submission_limits: &SubmissionLimits,
+    max_message_bytes: usize,
     message_limits: &MessageLimits,
     budget: &MemoryBudget,
     signing: &SigningConfig,
@@ -342,7 +352,7 @@ fn handle_stream(
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             process_request(
                 &mut stream,
-                submission_limits,
+                max_message_bytes,
                 message_limits,
                 budget,
                 signing,
@@ -353,20 +363,47 @@ fn handle_stream(
             Err(_) => DeliveryResult::temporary_failure("submission handler panicked", None),
         }
     };
-    let _ = write_response(&mut stream, &result, submission_limits.max_diagnostic_bytes)
-        .and_then(|()| stream.flush());
+    // SendFinal
+    let _ = write_final_result(&mut stream, &result).and_then(|()| stream.flush());
 }
 
 fn process_request(
     stream: &mut UnixStream,
-    submission_limits: &SubmissionLimits,
+    max_message_bytes: usize,
     message_limits: &MessageLimits,
     budget: &MemoryBudget,
     signing: &SigningConfig,
     relay: &RelayPool,
 ) -> DeliveryResult {
-    let request = match read_request(stream, submission_limits, budget) {
-        Ok(request) => request,
+    // ReadEnvelope -> ValidateEnvelope
+    let preamble = match read_envelope_preamble(stream) {
+        Ok(preamble) => preamble,
+        Err(error) => return submission_error_result(error),
+    };
+
+    // SendReady
+    let ready = Ready {
+        max_message_bytes: max_message_bytes as u64,
+        max_chunk_bytes: MAX_CHUNK_BYTES as u32,
+        max_diagnostic_bytes: crate::relay::DeliveryResult::MAX_DIAGNOSTIC_BYTES as u32,
+    };
+    if let Err(error) =
+        write_server_reply(stream, &ServerReply::Ready(ready)).and_then(|()| stream.flush())
+    {
+        return DeliveryResult::protocol_rejection(
+            format!("cannot send submission READY: {error}"),
+            None,
+        );
+    }
+
+    // ReadChunks
+    let retained = match read_chunk_stream(
+        stream,
+        max_message_bytes as u64,
+        MAX_CHUNK_BYTES as u32,
+        budget,
+    ) {
+        Ok(retained) => retained,
         Err(SubmissionError::BudgetExhausted {
             requested,
             capacity,
@@ -385,7 +422,9 @@ fn process_request(
             );
         }
     };
-    let (envelope, bytes, reservation) = request.into_parts();
+    let (bytes, reservation) = retained.into_parts();
+    let envelope = preamble.envelope;
+    // ParseMessage
     let limits = MessageLimits {
         max_headers: message_limits.max_headers,
         max_header_bytes: message_limits.max_header_bytes,
@@ -400,10 +439,12 @@ fn process_request(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
     let headers: Vec<_> = message.header_refs().collect();
+    // Sign
     let signature = match crate::dkim::sign(signing, &headers, message.body_hash(), timestamp) {
         Ok(signature) => signature,
         Err(error) => return DeliveryResult::protocol_rejection(error, None),
     };
+    // Relay
     let (result_tx, result_rx) = mpsc::sync_channel(1);
     let job = DeliveryJob {
         envelope,
@@ -419,4 +460,22 @@ fn process_request(
     });
     drop(reservation);
     result
+}
+
+fn submission_error_result(error: SubmissionError) -> DeliveryResult {
+    match error {
+        SubmissionError::BudgetExhausted {
+            requested,
+            capacity,
+        } => DeliveryResult::temporary_failure(
+            format!(
+                "submission memory budget exhausted: requested {requested} bytes, capacity {capacity} bytes"
+            ),
+            None,
+        ),
+        error => DeliveryResult::protocol_rejection(
+            format!("invalid submission frame: {error:?}"),
+            None,
+        ),
+    }
 }

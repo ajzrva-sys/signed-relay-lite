@@ -27,7 +27,8 @@ use signed_relay_lite::message::{Limits, Message};
 use signed_relay_lite::relay::{DeliveryJob, DeliveryResult, DeliveryStatus, Envelope, RelayPool};
 use signed_relay_lite::smtp::{deliver, SmtpConnection, SmtpStream};
 use signed_relay_lite::submission::{
-    read_response, MemoryBudget, SubmissionLimits, SubmissionServer,
+    read_server_reply, MemoryBudget, ServerReply, SubmissionLimits, SubmissionServer,
+    SubmissionServerConfig,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -237,18 +238,19 @@ fn verify_captured_dkim(message: &[u8], public_key: &PKey<Public>, selector: &st
     .unwrap_or(false)
 }
 
-fn srl1_request(message: &[u8]) -> Vec<u8> {
+fn srl2_request(message: &[u8]) -> Vec<u8> {
     let sender = b"sender@example.com";
     let recipient = b"recipient@example.net";
-    let mut frame = b"SRL1".to_vec();
+    let mut frame = b"SRL2".to_vec();
     frame.extend_from_slice(&0_u32.to_be_bytes());
     frame.extend_from_slice(&(sender.len() as u32).to_be_bytes());
     frame.extend_from_slice(sender);
     frame.extend_from_slice(&1_u32.to_be_bytes());
     frame.extend_from_slice(&(recipient.len() as u32).to_be_bytes());
     frame.extend_from_slice(recipient);
-    frame.extend_from_slice(&(message.len() as u64).to_be_bytes());
+    frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
     frame.extend_from_slice(message);
+    frame.extend_from_slice(&0_u32.to_be_bytes());
     frame
 }
 
@@ -332,10 +334,12 @@ fn end_to_end_submission_waits_for_final_250_and_dkim_verifies() {
     };
     let server = SubmissionServer::bind(
         &socket,
-        0o600,
-        Duration::from_secs(2),
-        1,
-        limits.clone(),
+        SubmissionServerConfig {
+            max_message_bytes: limits.max_message_bytes as usize,
+            submission_timeout: Duration::from_secs(2),
+            max_active_handlers: 1,
+            socket_mode: 0o600,
+        },
         Limits::testing(),
         MemoryBudget::new(1024 * 1024),
         signing,
@@ -362,7 +366,7 @@ second\t\tline\t \r\n\
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
     let client_socket = socket.clone();
     let client_limits = limits.clone();
-    let request = srl1_request(&original);
+    let request = srl2_request(&original);
     let client = thread::spawn(move || {
         let mut stream = UnixStream::connect(client_socket).unwrap();
         stream
@@ -372,7 +376,13 @@ second\t\tline\t \r\n\
             .set_write_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         stream.write_all(&request).unwrap();
-        let result = read_response(&mut stream, &client_limits).unwrap();
+        let _ = client_limits;
+        let ServerReply::Ready(_) = read_server_reply(&mut stream).unwrap() else {
+            panic!("server did not authorize message stream");
+        };
+        let ServerReply::Final(result) = read_server_reply(&mut stream).unwrap() else {
+            panic!("server did not return FINAL");
+        };
         result_tx.send(result).unwrap();
     });
 
