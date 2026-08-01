@@ -136,10 +136,227 @@ impl BodyCanonicalizer {
     }
 }
 
+// ── DKIM signing ────────────────────────────────────────────────────
+
+/// Borrowed reference to a message header.
+///
+/// `name` and `value` are borrowed slices from the retained message bytes.
+/// This avoids cloning header values and is designed to work with message
+/// header ranges in later tasks.
+#[derive(Clone, Debug)]
+pub struct HeaderRef<'a> {
+    pub name: &'a [u8],
+    pub value: &'a [u8],
+}
+
+impl HeaderRef<'_> {
+    fn is(&self, name: &str) -> bool {
+        self.name.eq_ignore_ascii_case(name.as_bytes())
+    }
+}
+
+/// Headers that participate in DKIM signing (in order).
+///
+/// The `from` header is listed first; the remaining set covers the common
+/// headers a relay can observe.  The list matches RFC 6376 recommended
+/// practice.
+const SIGNED_HEADERS: &[&str] = &[
+    "from",
+    "sender",
+    "reply-to",
+    "subject",
+    "date",
+    "message-id",
+    "to",
+    "cc",
+    "mime-version",
+    "content-type",
+    "content-transfer-encoding",
+    "in-reply-to",
+    "references",
+];
+
+/// Produce a relaxed/relaxed RSA-SHA256 DKIM signature.
+///
+/// `timestamp` is an explicit parameter so tests are deterministic;
+/// production callers obtain it through a small clock boundary.
+///
+/// Returns the signature field value as a bounded `Vec<u8>`.
+///
+/// Errors:
+/// - Zero or more than one `From` header present.
+/// - `From` domain does not match the configured domain (case-insensitive).
+/// - RSA-SHA256 signing failure.
+pub fn sign(
+    config: &crate::config::SigningConfig,
+    headers: &[HeaderRef<'_>],
+    body_hash: [u8; 32],
+    timestamp: u64,
+) -> Result<Vec<u8>, String> {
+    // Exactly one From header required.
+    let from_headers: Vec<&HeaderRef<'_>> = headers.iter().filter(|h| h.is("from")).collect();
+    if from_headers.len() != 1 {
+        return Err("message must contain exactly one From header".to_owned());
+    }
+    // From domain must match configured domain (case-insensitive).
+    let from_domain = from_domain(from_headers[0].value)
+        .ok_or_else(|| "cannot extract a single From domain".to_owned())?;
+    if !from_domain.eq_ignore_ascii_case(&config.domain) {
+        return Err(format!(
+            "From domain {from_domain} does not match configured domain"
+        ));
+    }
+
+    // Select the last occurrence of each signed header and build h= list.
+    // From is oversigned: its tag appears twice in h= so that any added
+    // From header invalidates the signature.
+    let mut selected: Vec<&HeaderRef<'_>> = Vec::new();
+    let mut h_names: Vec<&str> = Vec::new();
+    for &name in SIGNED_HEADERS {
+        if let Some(header) = headers.iter().rev().find(|h| h.is(name)) {
+            selected.push(header);
+            h_names.push(name);
+        }
+        if name == "from" {
+            h_names.push("from"); // Oversign From.
+        }
+    }
+
+    let body_hash_b64 = openssl::base64::encode_block(&body_hash);
+    let unsigned_value = format!(
+        "v=1; a=rsa-sha256; c=relaxed/relaxed; d={}; s={}; t={}; h={}; bh={}; b=",
+        config.domain,
+        config.selector,
+        timestamp,
+        h_names.join(":"),
+        body_hash_b64
+    );
+
+    // Sign: canonicalized selected headers + canonicalized DKIM-Signature
+    // header (with b= empty, trailing CRLF stripped per RFC 6376 §3.7).
+    use openssl::hash::MessageDigest;
+    use openssl::sign::Signer;
+
+    let mut signer = Signer::new(MessageDigest::sha256(), config.key.as_ref())
+        .map_err(|e| format!("cannot initialize RSA-SHA256 signer: {e}"))?;
+    for header in &selected {
+        signer
+            .update(&canonicalize_header(header.name, header.value))
+            .map_err(|e| format!("cannot hash header: {e}"))?;
+    }
+    signer
+        .update(&canonicalize_signature_header(unsigned_value.as_bytes()))
+        .map_err(|e| format!("cannot hash DKIM-Signature: {e}"))?;
+    let signature = signer
+        .sign_to_vec()
+        .map_err(|e| format!("RSA-SHA256 signing failed: {e}"))?;
+
+    let folded = fold_signature(&format!(
+        "{unsigned_value}{}",
+        openssl::base64::encode_block(&signature)
+    ));
+    Ok(folded.into_bytes())
+}
+
+/// Canonicalize the DKIM-Signature header itself for hash input.
+///
+/// RFC 6376 §3.7: the signature header is relaxed-canonicalized with `b=`
+/// (empty value), and the trailing CRLF is stripped because it is the last
+/// header in the hash input.
+fn canonicalize_signature_header(value: &[u8]) -> Vec<u8> {
+    let mut canonical = canonicalize_header(b"DKIM-Signature", value);
+    canonical.truncate(canonical.len() - 2);
+    canonical
+}
+
+/// Extract the domain portion from a From header value.
+///
+/// Handles angle-addr (`<user@domain>`), bare addr-spec, comments, quoted
+/// strings. Returns `None` for multiple addresses, malformed input, or
+/// unparseable domain.
+fn from_domain(value: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(value).ok()?.trim();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut comment_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut commas = 0usize;
+    for ch in text.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && ch == '\\' {
+            escaped = true;
+        } else if comment_depth == 0 && ch == '"' {
+            quoted = !quoted;
+        } else if !quoted {
+            match ch {
+                '(' => comment_depth += 1,
+                ')' if comment_depth > 0 => comment_depth -= 1,
+                '<' if comment_depth == 0 => angle_depth += 1,
+                '>' if comment_depth == 0 && angle_depth > 0 => angle_depth -= 1,
+                ',' if comment_depth == 0 && angle_depth == 0 => commas += 1,
+                _ => {}
+            }
+        }
+    }
+    if quoted || comment_depth != 0 || angle_depth != 0 || commas != 0 {
+        return None;
+    }
+    let address = match (text.rfind('<'), text.rfind('>')) {
+        (Some(start), Some(end)) if start < end => &text[start + 1..end],
+        (None, None) => text,
+        _ => return None,
+    };
+    let (_, domain) = address.rsplit_once('@')?;
+    let domain = domain.trim().trim_end_matches('.');
+    if domain.is_empty()
+        || !domain
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return None;
+    }
+    Some(domain.to_ascii_lowercase())
+}
+
+/// Fold a DKIM-Signature field value at 72-column boundaries.
+///
+/// Inserts `CRLF + TAB` before tokens that would exceed the limit,
+/// ensuring the result remains valid per RFC 6376 §3.5.
+fn fold_signature(value: &str) -> String {
+    const LIMIT: usize = 72;
+    let mut out = String::with_capacity(value.len() + value.len() / LIMIT * 3);
+    let mut column = 0;
+    for token in value.split(' ') {
+        let needed = if column == 0 {
+            token.len()
+        } else {
+            token.len() + 1
+        };
+        if column > 0 && column + needed > LIMIT {
+            out.push_str("\r\n\t");
+            column = 1;
+        } else if column > 0 {
+            out.push(' ');
+            column += 1;
+        }
+        out.push_str(token);
+        column += token.len();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SigningConfig;
     use openssl::base64;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Rsa;
+    use openssl::sign::Verifier;
+    use std::sync::Arc;
 
     fn body(parts: &[&[u8]]) -> String {
         let mut c = BodyCanonicalizer::default();
@@ -218,5 +435,416 @@ mod tests {
             .map(std::slice::from_ref)
             .collect();
         assert_eq!(full, body(&single_bytes));
+    }
+
+    // ── signing verification tests (RED phase) ──────────────────────
+
+    /// Helper: generate an RSA keypair for tests.
+    fn test_key() -> PKey<openssl::pkey::Private> {
+        PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap()
+    }
+
+    /// Helper: build a SigningConfig for tests.
+    fn test_config(key: &PKey<openssl::pkey::Private>) -> SigningConfig {
+        SigningConfig {
+            domain: "example.com".into(),
+            selector: "test".into(),
+            key: Arc::new(key.clone()),
+        }
+    }
+
+    /// The primary signing verification test: a generated RSA key produces
+    /// a signature that OpenSSL can verify, with From oversigning.
+    #[test]
+    fn generated_signature_verifies_and_oversigns_from() {
+        let key = test_key();
+        let config = test_config(&key);
+
+        let from = HeaderRef {
+            name: b"From",
+            value: b"Alice <alice@example.com>",
+        };
+        let subject = HeaderRef {
+            name: b"Subject",
+            value: b"A  test",
+        };
+        let headers = [from, subject];
+
+        let mut body_c = BodyCanonicalizer::default();
+        body_c.update(b"hello\n");
+        let body_hash = body_c.finish();
+        let timestamp: u64 = 1_722_000_000;
+
+        let value_bytes = sign(&config, &headers, body_hash, timestamp).unwrap();
+        let value = String::from_utf8(value_bytes).unwrap();
+
+        // From is oversigned: h= includes from:from:...
+        assert!(
+            value.contains("h=from:from:subject;"),
+            "h= should oversign From, got: {value}"
+        );
+
+        // Extract and verify the b= signature.
+        let b_start = value.find("b=").unwrap() + 2;
+        let signature_text: String = value[b_start..]
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        let signature = base64::decode_block(&signature_text).unwrap();
+
+        // Reconstruct the unsigned DKIM-Signature header value for verification.
+        let unsigned = &value[..b_start];
+        let canonicalized_sig = canonicalize_signature_header(unsigned.as_bytes());
+
+        let mut verifier = Verifier::new(openssl::hash::MessageDigest::sha256(), &key).unwrap();
+        verifier
+            .update(&canonicalize_header(b"From", b"Alice <alice@example.com>"))
+            .unwrap();
+        verifier
+            .update(&canonicalize_header(b"Subject", b"A  test"))
+            .unwrap();
+        verifier.update(&canonicalized_sig).unwrap();
+        assert!(verifier.verify(&signature).unwrap());
+    }
+
+    /// Zero From headers must be rejected.
+    #[test]
+    fn rejects_missing_from_header() {
+        let key = test_key();
+        let config = test_config(&key);
+
+        let subject = HeaderRef {
+            name: b"Subject",
+            value: b"test",
+        };
+        let headers = [subject];
+        let body_hash = [0u8; 32];
+
+        let err = sign(&config, &headers, body_hash, 1_722_000_000).unwrap_err();
+        assert!(
+            err.contains("exactly one From"),
+            "error should mention exactly one From, got: {err}"
+        );
+    }
+
+    /// Duplicate From headers must be rejected.
+    #[test]
+    fn rejects_duplicate_from_headers() {
+        let key = test_key();
+        let config = test_config(&key);
+
+        let from1 = HeaderRef {
+            name: b"From",
+            value: b"alice@example.com",
+        };
+        let from2 = HeaderRef {
+            name: b"from",
+            value: b"bob@example.com",
+        };
+        let headers = [from1, from2];
+        let body_hash = [0u8; 32];
+
+        let err = sign(&config, &headers, body_hash, 1_722_000_000).unwrap_err();
+        assert!(
+            err.contains("exactly one From"),
+            "error should mention exactly one From, got: {err}"
+        );
+    }
+
+    /// From domain must match the configured domain (case-insensitive).
+    #[test]
+    fn rejects_mismatched_from_domain() {
+        let key = test_key();
+        let config = test_config(&key);
+
+        let from = HeaderRef {
+            name: b"From",
+            value: b"alice@other-domain.com",
+        };
+        let headers = [from];
+        let body_hash = [0u8; 32];
+
+        let err = sign(&config, &headers, body_hash, 1_722_000_000).unwrap_err();
+        assert!(
+            err.contains("does not match"),
+            "error should mention domain mismatch, got: {err}"
+        );
+    }
+
+    /// From domain matching is case-insensitive.
+    #[test]
+    fn accepts_from_domain_case_insensitive() {
+        let key = test_key();
+        let config = test_config(&key);
+
+        let from = HeaderRef {
+            name: b"From",
+            value: b"alice@EXAMPLE.COM",
+        };
+        let headers = [from];
+
+        let mut body_c = BodyCanonicalizer::default();
+        body_c.update(b"hello\n");
+        let body_hash = body_c.finish();
+
+        // Should succeed — domain comparison is case-insensitive.
+        let result = sign(&config, &headers, body_hash, 1_722_000_000);
+        assert!(
+            result.is_ok(),
+            "case-insensitive domain match should succeed: {result:?}"
+        );
+    }
+
+    /// Header selection uses the last occurrence of each signed field.
+    #[test]
+    fn uses_last_occurrence_of_each_signed_header() {
+        let key = test_key();
+        let config = test_config(&key);
+
+        let from = HeaderRef {
+            name: b"From",
+            value: b"alice@example.com",
+        };
+        let subject1 = HeaderRef {
+            name: b"Subject",
+            value: b"first",
+        };
+        let subject2 = HeaderRef {
+            name: b"Subject",
+            value: b"second",
+        };
+        let headers = [from, subject1, subject2];
+
+        let mut body_c = BodyCanonicalizer::default();
+        body_c.update(b"body");
+        let body_hash = body_c.finish();
+        let timestamp: u64 = 1_722_000_000;
+
+        let value_bytes = sign(&config, &headers, body_hash, timestamp).unwrap();
+        let value = String::from_utf8(value_bytes).unwrap();
+
+        // The b= value is the last field; everything before it is the unsigned header.
+        let b_start = value.find("b=").unwrap() + 2;
+        let signature_text: String = value[b_start..]
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        let signature = base64::decode_block(&signature_text).unwrap();
+
+        let unsigned = &value[..b_start];
+        let canonicalized_sig = canonicalize_signature_header(unsigned.as_bytes());
+
+        // Verify with "second" (the last occurrence) — should pass.
+        let mut verifier = Verifier::new(openssl::hash::MessageDigest::sha256(), &key).unwrap();
+        verifier
+            .update(&canonicalize_header(b"From", b"alice@example.com"))
+            .unwrap();
+        verifier
+            .update(&canonicalize_header(b"Subject", b"second"))
+            .unwrap();
+        verifier.update(&canonicalized_sig).unwrap();
+        assert!(verifier.verify(&signature).unwrap());
+
+        // Verify with "first" (the earlier occurrence) — should fail.
+        let mut verifier2 = Verifier::new(openssl::hash::MessageDigest::sha256(), &key).unwrap();
+        verifier2
+            .update(&canonicalize_header(b"From", b"alice@example.com"))
+            .unwrap();
+        verifier2
+            .update(&canonicalize_header(b"Subject", b"first"))
+            .unwrap();
+        verifier2.update(&canonicalized_sig).unwrap();
+        assert!(!verifier2.verify(&signature).unwrap());
+    }
+
+    /// Signature folding uses CRLF+tab and the folded result still verifies.
+    #[test]
+    fn folded_signature_uses_crlf_and_verifies() {
+        let key = test_key();
+        let config = test_config(&key);
+
+        // Use many headers to force folding (each adds to the signature length).
+        let from = HeaderRef {
+            name: b"From",
+            value: b"alice@example.com",
+        };
+        let to = HeaderRef {
+            name: b"To",
+            value: b"bob@example.com",
+        };
+        let cc = HeaderRef {
+            name: b"Cc",
+            value: b"carol@example.com",
+        };
+        let subject = HeaderRef {
+            name: b"Subject",
+            value: b"A moderately long subject line to encourage folding",
+        };
+        let headers = [from, to, cc, subject];
+
+        let mut body_c = BodyCanonicalizer::default();
+        body_c.update(b"hello world\n");
+        let body_hash = body_c.finish();
+        let timestamp: u64 = 1_722_000_000;
+
+        let value_bytes = sign(&config, &headers, body_hash, timestamp).unwrap();
+        let value = String::from_utf8_lossy(&value_bytes);
+
+        // Check that the folded signature contains CRLF+tab continuations.
+        assert!(
+            value.contains("\r\n\t"),
+            "folded signature should contain CRLF+tab, got: {value:?}"
+        );
+
+        // Strip all whitespace to extract the raw b= value and verify.
+        // Find the LAST "b=" to avoid matching "bh=" substring.
+        let b_start = value.rfind("b=").unwrap() + 2;
+        let signature_text: String = value[b_start..]
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        let signature = base64::decode_block(&signature_text).unwrap();
+
+        // Reconstruct the unsigned value: everything up to and including "b=",
+        // then strip folding to get the canonical field value the signer hashed.
+        let unsigned = &value[..b_start];
+        // Reconstruct the unfolded unsigned value for the signer's hash input.
+        let unfolded = unsigned.replace("\r\n\t", " ");
+        let canonicalized_sig = canonicalize_signature_header(unfolded.as_bytes());
+
+        let mut verifier = Verifier::new(openssl::hash::MessageDigest::sha256(), &key).unwrap();
+        // Headers must be in SIGNED_HEADERS order: from, subject, ..., to, cc.
+        verifier
+            .update(&canonicalize_header(b"From", b"alice@example.com"))
+            .unwrap();
+        verifier
+            .update(&canonicalize_header(
+                b"Subject",
+                b"A moderately long subject line to encourage folding",
+            ))
+            .unwrap();
+        verifier
+            .update(&canonicalize_header(b"To", b"bob@example.com"))
+            .unwrap();
+        verifier
+            .update(&canonicalize_header(b"Cc", b"carol@example.com"))
+            .unwrap();
+        verifier.update(&canonicalized_sig).unwrap();
+        assert!(verifier.verify(&signature).unwrap());
+    }
+
+    // ── adversarial tests ───────────────────────────────────────────
+
+    /// Header name matching is case-insensitive (e.g. "FROM" == "from").
+    #[test]
+    fn case_insensitive_header_name_matching() {
+        let key = test_key();
+        let config = test_config(&key);
+
+        let from = HeaderRef {
+            name: b"FROM",
+            value: b"alice@example.com",
+        };
+        let subject = HeaderRef {
+            name: b"SUBJECT",
+            value: b"test",
+        };
+        let headers = [from, subject];
+
+        let mut body_c = BodyCanonicalizer::default();
+        body_c.update(b"body");
+        let body_hash = body_c.finish();
+        let timestamp: u64 = 1_722_000_000;
+
+        let value_bytes = sign(&config, &headers, body_hash, timestamp).unwrap();
+        let value = String::from_utf8(value_bytes).unwrap();
+
+        // Verify it still works with uppercase header names.
+        let b_start = value.find("b=").unwrap() + 2;
+        let signature_text: String = value[b_start..]
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        let signature = base64::decode_block(&signature_text).unwrap();
+
+        let unsigned = &value[..b_start];
+        let canonicalized_sig = canonicalize_signature_header(unsigned.as_bytes());
+
+        let mut verifier = Verifier::new(openssl::hash::MessageDigest::sha256(), &key).unwrap();
+        verifier
+            .update(&canonicalize_header(b"FROM", b"alice@example.com"))
+            .unwrap();
+        verifier
+            .update(&canonicalize_header(b"SUBJECT", b"test"))
+            .unwrap();
+        verifier.update(&canonicalized_sig).unwrap();
+        assert!(verifier.verify(&signature).unwrap());
+    }
+
+    /// When multiple occurrences of a signed header exist, the last one
+    /// is selected and earlier ones are excluded from the hash.
+    #[test]
+    fn duplicate_signed_header_selects_last() {
+        let key = test_key();
+        let config = test_config(&key);
+
+        let from = HeaderRef {
+            name: b"From",
+            value: b"alice@example.com",
+        };
+        let to1 = HeaderRef {
+            name: b"To",
+            value: b"first@example.com",
+        };
+        let to2 = HeaderRef {
+            name: b"To",
+            value: b"second@example.com",
+        };
+        let headers = [from, to1, to2];
+
+        let mut body_c = BodyCanonicalizer::default();
+        body_c.update(b"body");
+        let body_hash = body_c.finish();
+        let timestamp: u64 = 1_722_000_000;
+
+        let value_bytes = sign(&config, &headers, body_hash, timestamp).unwrap();
+        let value = String::from_utf8(value_bytes).unwrap();
+
+        let b_start = value.find("b=").unwrap() + 2;
+        let signature_text: String = value[b_start..]
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        let signature = base64::decode_block(&signature_text).unwrap();
+
+        let unsigned = &value[..b_start];
+        let canonicalized_sig = canonicalize_signature_header(unsigned.as_bytes());
+
+        // Verify with "second@example.com" (the last To) — should pass.
+        let mut verifier = Verifier::new(openssl::hash::MessageDigest::sha256(), &key).unwrap();
+        verifier
+            .update(&canonicalize_header(b"From", b"alice@example.com"))
+            .unwrap();
+        verifier
+            .update(&canonicalize_header(b"To", b"second@example.com"))
+            .unwrap();
+        verifier.update(&canonicalized_sig).unwrap();
+        assert!(verifier.verify(&signature).unwrap());
+
+        // Verify with "first@example.com" — should fail.
+        let mut verifier2 = Verifier::new(openssl::hash::MessageDigest::sha256(), &key).unwrap();
+        verifier2
+            .update(&canonicalize_header(b"From", b"alice@example.com"))
+            .unwrap();
+        verifier2
+            .update(&canonicalize_header(b"To", b"first@example.com"))
+            .unwrap();
+        verifier2.update(&canonicalized_sig).unwrap();
+        assert!(!verifier2.verify(&signature).unwrap());
     }
 }

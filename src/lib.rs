@@ -2,6 +2,7 @@
 //!
 //! All public modules will be declared here.
 
+pub mod config;
 pub mod dkim;
 pub mod relay;
 
