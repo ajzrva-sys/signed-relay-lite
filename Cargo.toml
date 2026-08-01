@@ -1,0 +1,17 @@
+[package]
+name = "signed-relay-lite"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+description = "A bounded in-memory DKIM submission relay for a fixed smarthost"
+
+[dependencies]
+libc = "=0.2.177"
+openssl = "=0.10.75"
+openssl-sys = "=0.9.111"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
