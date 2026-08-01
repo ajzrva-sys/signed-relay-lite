@@ -111,6 +111,116 @@ impl DeliveryResult {
     }
 }
 
+/// Validated ASCII-only bare addr-spec for an outbound envelope.
+///
+/// The SMTP client adds `<` and `>` brackets; callers supply the bare
+/// address (e.g. `user@example.com`).
+///
+/// Validation rules:
+/// - ASCII printable only (0x20–0x7E), no control bytes, no CR/LF
+/// - No spaces, no angle brackets (`<`, `>`)
+/// - Maximum 254 bytes per address (RFC 5321)
+/// - Sender may be empty (null reverse path `<>`)
+/// - At least one recipient required
+/// - Maximum 100 recipients
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Envelope {
+    sender: Vec<u8>,
+    recipients: Vec<Vec<u8>>,
+}
+
+/// Maximum bytes for a single envelope address (RFC 5321 §4.5.3.1).
+const MAX_ADDRESS_BYTES: usize = 254;
+
+/// Maximum number of recipients per envelope.
+const MAX_RECIPIENTS: usize = 100;
+
+/// Validation errors for [`Envelope`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EnvelopeError {
+    /// Address contains a non-ASCII byte, control character, space, or angle bracket.
+    InvalidCharacter { addr: Vec<u8>, byte: u8 },
+    /// Address exceeds the 254-byte RFC 5321 limit.
+    AddressTooLong(usize),
+    /// Recipient list is empty.
+    NoRecipients,
+    /// Too many recipients (exceeds [`MAX_RECIPIENTS`]).
+    TooManyRecipients(usize),
+}
+
+impl Envelope {
+    /// Build a validated envelope from bare addr-spec bytes.
+    ///
+    /// `sender` may be empty (null reverse path). Each address in
+    /// `recipients` must pass the same validation rules.
+    pub fn new(sender: &[u8], recipients: Vec<Vec<u8>>) -> Result<Self, EnvelopeError> {
+        // Sender: empty is OK (null reverse path); otherwise validate.
+        if !sender.is_empty() {
+            validate_address(sender)?;
+        }
+
+        // Recipients: must be non-empty.
+        if recipients.is_empty() {
+            return Err(EnvelopeError::NoRecipients);
+        }
+        if recipients.len() > MAX_RECIPIENTS {
+            return Err(EnvelopeError::TooManyRecipients(recipients.len()));
+        }
+        for rcpt in &recipients {
+            validate_address(rcpt)?;
+        }
+
+        Ok(Self {
+            sender: sender.to_vec(),
+            recipients,
+        })
+    }
+
+    /// The (possibly empty) reverse-path.
+    pub fn sender(&self) -> &[u8] {
+        &self.sender
+    }
+
+    /// Borrow the validated recipient list.
+    pub fn recipients(&self) -> &[Vec<u8>] {
+        &self.recipients
+    }
+}
+
+/// Validate a single bare addr-spec.
+///
+/// Rules: ASCII printable (0x20–0x7E) only, no control bytes (including
+/// CR/LF), no spaces, no angle brackets, max [`MAX_ADDRESS_BYTES`] bytes.
+fn validate_address(addr: &[u8]) -> Result<(), EnvelopeError> {
+    if addr.len() > MAX_ADDRESS_BYTES {
+        return Err(EnvelopeError::AddressTooLong(addr.len()));
+    }
+    for &b in addr {
+        // Reject anything outside printable ASCII range 0x20..=0x7E.
+        if b < 0x20 || b > 0x7E {
+            return Err(EnvelopeError::InvalidCharacter {
+                addr: addr.to_vec(),
+                byte: b,
+            });
+        }
+        // Space (0x20) is in the printable range but forbidden in bare addr-spec.
+        if b == b' ' {
+            return Err(EnvelopeError::InvalidCharacter {
+                addr: addr.to_vec(),
+                byte: b,
+            });
+        }
+        // Angle brackets are forbidden — caller must not add them.
+        if b == b'<' || b == b'>' {
+            return Err(EnvelopeError::InvalidCharacter {
+                addr: addr.to_vec(),
+                byte: b,
+            });
+        }
+    }
+    Ok(())
+}
+
 // ── tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -272,5 +382,156 @@ mod tests {
         let a = DeliveryResult::delivered("ok", Some(250));
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    // -- envelope validation --------------------------------------------
+
+    #[test]
+    fn envelope_rejects_command_injection() {
+        assert!(Envelope::new(
+            b"sender@example.com\r\nDATA",
+            vec![b"recipient@example.net".to_vec()]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn envelope_accepts_null_reverse_path() {
+        assert!(Envelope::new(b"", vec![b"recipient@example.net".to_vec()]).is_ok());
+    }
+
+    #[test]
+    fn envelope_rejects_empty_recipients() {
+        assert!(Envelope::new(b"sender@example.com", vec![]).is_err());
+        assert_eq!(
+            Envelope::new(b"sender@example.com", vec![]).unwrap_err(),
+            EnvelopeError::NoRecipients
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_non_ascii_bytes() {
+        // 0x80 is above printable ASCII range
+        assert!(Envelope::new(
+            b"sender@example.com",
+            vec![b"rcpt@ex\x80ample.net".to_vec()]
+        )
+        .is_err());
+        // Verify the error variant
+        match Envelope::new(b"sender@example.com", vec![b"bad\x80".to_vec()]) {
+            Err(EnvelopeError::InvalidCharacter { byte: 0x80, .. }) => {}
+            other => panic!("expected InvalidCharacter(0x80), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn envelope_rejects_spaces_in_addresses() {
+        assert!(Envelope::new(
+            b"sender @example.com",
+            vec![b"recipient@example.net".to_vec()]
+        )
+        .is_err());
+        assert!(Envelope::new(
+            b"sender@example.com",
+            vec![b"recipient @example.net".to_vec()]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn envelope_rejects_angle_brackets() {
+        assert!(Envelope::new(
+            b"<sender@example.com>",
+            vec![b"recipient@example.net".to_vec()]
+        )
+        .is_err());
+        assert!(Envelope::new(
+            b"sender@example.com",
+            vec![b"<recipient@example.net>".to_vec()]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn envelope_rejects_control_bytes() {
+        // NUL
+        assert!(Envelope::new(
+            b"sender@example.com",
+            vec![b"rcpt@exam\x00ple.net".to_vec()]
+        )
+        .is_err());
+        // CR
+        assert!(
+            Envelope::new(b"sender@example.com", vec![b"rcpt@example.com\r".to_vec()]).is_err()
+        );
+        // LF
+        assert!(
+            Envelope::new(b"sender@example.com", vec![b"rcpt@example.com\n".to_vec()]).is_err()
+        );
+        // TAB (0x09)
+        assert!(
+            Envelope::new(b"sender@example.com", vec![b"rcpt@exam\tple.net".to_vec()]).is_err()
+        );
+        // DEL (0x7F)
+        assert!(Envelope::new(
+            b"sender@example.com",
+            vec![b"rcpt@exam\x7Fple.net".to_vec()]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn envelope_rejects_address_over_254_bytes() {
+        // 255 bytes → rejected
+        let addr_255 = vec![b'a'; 255];
+        assert!(
+            Envelope::new(b"sender@example.com", vec![addr_255.clone()]).is_err(),
+            "255-byte address should be rejected"
+        );
+    }
+
+    #[test]
+    fn envelope_accepts_address_at_254_bytes() {
+        // Exactly 254 bytes → accepted
+        let addr_254 = vec![b'a'; 254];
+        assert!(
+            Envelope::new(b"sender@example.com", vec![addr_254]).is_ok(),
+            "254-byte address should be accepted"
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_recipient_count_101() {
+        let rcpts: Vec<Vec<u8>> = (0..101)
+            .map(|i| format!("rcpt{}@example.net", i).into_bytes())
+            .collect();
+        assert!(
+            Envelope::new(b"sender@example.com", rcpts).is_err(),
+            "101 recipients should be rejected"
+        );
+    }
+
+    #[test]
+    fn envelope_accepts_recipient_count_100() {
+        let rcpts: Vec<Vec<u8>> = (0..100)
+            .map(|i| format!("rcpt{}@example.net", i).into_bytes())
+            .collect();
+        assert!(
+            Envelope::new(b"sender@example.com", rcpts).is_ok(),
+            "100 recipients should be accepted"
+        );
+    }
+
+    #[test]
+    fn envelope_accessors_are_read_only() {
+        let env = Envelope::new(
+            b"sender@example.com",
+            vec![b"rcpt1@example.net".to_vec(), b"rcpt2@example.net".to_vec()],
+        )
+        .unwrap();
+        assert_eq!(env.sender(), b"sender@example.com");
+        assert_eq!(env.recipients().len(), 2);
+        assert_eq!(env.recipients()[0], b"rcpt1@example.net".as_slice());
+        assert_eq!(env.recipients()[1], b"rcpt2@example.net".as_slice());
     }
 }
