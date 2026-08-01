@@ -1,0 +1,935 @@
+//! Strict bounded SRL1 request/response binary codecs.
+//!
+//! Wire format is independent of sockets — reads and writes go through
+//! `std::io::Read` and `std::io::Write`, making the codecs testable
+//! with `std::io::Cursor`.
+//!
+//! # Wire format — Request
+//!
+//! ```text
+//! [magic: 4B "SRL1"] [flags: 1B]
+//! [sender_len: 2B BE] [sender: NB]
+//! [rcpt_count: 2B BE]
+//!   [for each: rcpt_len: 2B BE, rcpt: NB]
+//! [msg_len: 8B BE] [msg: NB]
+//! ```
+//!
+//! # Wire format — Response
+//!
+//! ```text
+//! [status: 1B] [ambiguous: 1B]
+//! [smtp_code: 2B BE]            (0 ↔ None)
+//! [diag_len: 2B BE] [diag: NB]  (UTF-8)
+//! ```
+
+use std::io::{self, Read, Write};
+
+use crate::relay::{DeliveryResult, DeliveryStatus, Envelope, EnvelopeError};
+
+// ── Protocol constants ────────────────────────────────────────────────
+
+/// Protocol magic bytes.
+const MAGIC: &[u8; 4] = b"SRL1";
+
+/// Currently supported flags value (none set).
+const FLAGS_V0: u8 = 0x00;
+
+/// Wire status byte for `DeliveryStatus::Delivered`.
+const STATUS_DELIVERED: u8 = 0;
+/// Wire status byte for `DeliveryStatus::TemporaryFailure`.
+const STATUS_TEMPORARY: u8 = 1;
+/// Wire status byte for `DeliveryStatus::PermanentFailure`.
+const STATUS_PERMANENT: u8 = 2;
+/// Wire status byte for `DeliveryStatus::ProtocolRejection`.
+const STATUS_PROTOCOL: u8 = 3;
+
+// ── Limits ────────────────────────────────────────────────────────────
+
+/// Bounded limits for the submission codec.
+///
+/// All limits are enforced *before* allocating memory for the decoded
+/// payload, so a malicious frame cannot cause unbounded allocation.
+#[derive(Clone, Debug)]
+pub struct SubmissionLimits {
+    /// Maximum number of recipients per envelope.
+    pub max_recipients: usize,
+    /// Maximum bytes for a single envelope address.
+    pub max_address_bytes: usize,
+    /// Maximum message body bytes (as u64 for wire-checked conversion).
+    pub max_message_bytes: u64,
+    /// Maximum diagnostic string bytes (UTF-8) in a response.
+    pub max_diagnostic_bytes: usize,
+}
+
+impl SubmissionLimits {
+    /// Generous defaults for testing / development.
+    pub fn permissive() -> Self {
+        Self {
+            max_recipients: 100,
+            max_address_bytes: 254,
+            max_message_bytes: 50 * 1024 * 1024, // 50 MiB
+            max_diagnostic_bytes: 4096,
+        }
+    }
+}
+
+// ── Errors ────────────────────────────────────────────────────────────
+
+/// Errors produced during submission codec operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmissionError {
+    /// Wire magic is not `SRL1`.
+    InvalidMagic,
+    /// Flags byte contains unknown bits.
+    UnknownFlags(u8),
+    /// Declared recipient count exceeds the configured limit.
+    TooManyRecipients { count: usize, limit: usize },
+    /// An address field exceeds the configured limit.
+    AddressTooLong { len: usize, limit: usize },
+    /// Declared message length exceeds the configured limit.
+    MessageTooLarge { len: u64, limit: u64 },
+    /// Diagnostic string exceeds the configured limit.
+    DiagnosticTooLong { len: usize, limit: usize },
+    /// Diagnostic bytes are not valid UTF-8.
+    InvalidDiagnosticUtf8,
+    /// The underlying reader/writer returned an I/O error.
+    /// Typically `UnexpectedEof` for truncated frames.
+    Io(io::ErrorKind),
+    /// Envelope construction validation failed.
+    Envelope(EnvelopeError),
+}
+
+impl From<io::Error> for SubmissionError {
+    fn from(e: io::Error) -> Self {
+        SubmissionError::Io(e.kind())
+    }
+}
+
+impl From<EnvelopeError> for SubmissionError {
+    fn from(e: EnvelopeError) -> Self {
+        SubmissionError::Envelope(e)
+    }
+}
+
+// ── Decoded request ───────────────────────────────────────────────────
+
+/// A decoded submission request.
+///
+/// The message bytes are kept raw (not parsed) — message parsing happens
+/// later in the pipeline. The `Envelope` is constructed through
+/// validation.
+#[derive(Debug)]
+pub struct SubmissionRequest {
+    pub envelope: Envelope,
+    pub message: Vec<u8>,
+}
+
+// ── Wire helpers ──────────────────────────────────────────────────────
+
+/// Read exactly `n` bytes into a new `Vec<u8>`.
+fn read_bytes<R: Read>(r: &mut R, n: usize) -> Result<Vec<u8>, SubmissionError> {
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Read a big-endian `u16`.
+fn read_u16<R: Read>(r: &mut R) -> Result<u16, SubmissionError> {
+    let mut buf = [0u8; 2];
+    r.read_exact(&mut buf)?;
+    Ok(u16::from_be_bytes(buf))
+}
+
+/// Read a big-endian `u64`, then validate it fits in `usize` and is <= limit.
+///
+/// Returns the value as `usize` if valid, or an appropriate error.
+/// Never casts an untrusted `u64` directly to `usize`.
+fn read_message_len<R: Read>(r: &mut R, limit: u64) -> Result<usize, SubmissionError> {
+    let mut buf = [0u8; 8];
+    r.read_exact(&mut buf)?;
+    let len = u64::from_be_bytes(buf);
+    if len > limit {
+        return Err(SubmissionError::MessageTooLarge { len, limit });
+    }
+    // We verified len <= limit. Now check it fits in usize (handles 32-bit).
+    usize::try_from(len).map_err(|_| SubmissionError::MessageTooLarge { len, limit })
+}
+
+/// Write a big-endian `u16`.
+fn write_u16<W: Write>(w: &mut W, v: u16) -> Result<(), io::Error> {
+    w.write_all(&v.to_be_bytes())
+}
+
+/// Write a big-endian `u64`.
+fn write_u64<W: Write>(w: &mut W, v: u64) -> Result<(), io::Error> {
+    w.write_all(&v.to_be_bytes())
+}
+
+/// Truncate `s` to at most `max` bytes at a UTF-8 character boundary.
+fn truncate_to_utf8_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+// ── Request codec ─────────────────────────────────────────────────────
+
+/// Decode a submission request from a framed reader.
+///
+/// All lengths are validated against `limits` *before* allocating the
+/// corresponding buffer. Envelope addresses are validated through
+/// `Envelope::new`.
+pub fn read_request<R: Read>(
+    r: &mut R,
+    limits: &SubmissionLimits,
+) -> Result<SubmissionRequest, SubmissionError> {
+    // Magic (4 bytes)
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)?;
+    if magic != *MAGIC {
+        return Err(SubmissionError::InvalidMagic);
+    }
+
+    // Flags (1 byte)
+    let mut flags_buf = [0u8; 1];
+    r.read_exact(&mut flags_buf)?;
+    let flags = flags_buf[0];
+    if flags != FLAGS_V0 {
+        return Err(SubmissionError::UnknownFlags(flags));
+    }
+
+    // Sender (length-prefixed, u16)
+    let sender_len = read_u16(r)? as usize;
+    let sender = read_bytes(r, sender_len)?;
+
+    // Recipient count (u16, checked before reading recipients)
+    let rcpt_count = read_u16(r)? as usize;
+    if rcpt_count > limits.max_recipients {
+        return Err(SubmissionError::TooManyRecipients {
+            count: rcpt_count,
+            limit: limits.max_recipients,
+        });
+    }
+
+    // Recipients (each length-prefixed, validated against address limit)
+    let mut recipients = Vec::with_capacity(rcpt_count);
+    for _ in 0..rcpt_count {
+        let addr_len = read_u16(r)? as usize;
+        if addr_len > limits.max_address_bytes {
+            return Err(SubmissionError::AddressTooLong {
+                len: addr_len,
+                limit: limits.max_address_bytes,
+            });
+        }
+        recipients.push(read_bytes(r, addr_len)?);
+    }
+
+    // Message length (u64, checked conversion to usize)
+    let msg_len = read_message_len(r, limits.max_message_bytes)?;
+    let message = read_bytes(r, msg_len)?;
+
+    // Construct envelope through validation.
+    let envelope = Envelope::new(&sender, recipients)?;
+
+    Ok(SubmissionRequest { envelope, message })
+}
+
+/// Encode a submission request to a writer.
+pub fn write_request<W: Write>(w: &mut W, request: &SubmissionRequest) -> Result<(), io::Error> {
+    // Magic
+    w.write_all(MAGIC)?;
+    // Flags
+    w.write_all(&[FLAGS_V0])?;
+    // Sender
+    let sender = request.envelope.sender();
+    write_u16(w, u16::try_from(sender.len()).expect("sender exceeds u16"))?;
+    w.write_all(sender)?;
+    // Recipient count
+    let recipients = request.envelope.recipients();
+    write_u16(
+        w,
+        u16::try_from(recipients.len()).expect("too many recipients"),
+    )?;
+    // Recipients
+    for rcpt in recipients {
+        write_u16(w, u16::try_from(rcpt.len()).expect("address exceeds u16"))?;
+        w.write_all(rcpt)?;
+    }
+    // Message length + data
+    write_u64(
+        w,
+        u64::try_from(request.message.len()).expect("message exceeds u64"),
+    )?;
+    w.write_all(&request.message)?;
+    Ok(())
+}
+
+// ── Response codec ────────────────────────────────────────────────────
+
+/// Decode a submission response from a framed reader.
+///
+/// `smtp_code` of 0 on the wire maps to `None`.
+pub fn read_response<R: Read>(
+    r: &mut R,
+    limits: &SubmissionLimits,
+) -> Result<DeliveryResult, SubmissionError> {
+    // Status
+    let mut status_buf = [0u8; 1];
+    r.read_exact(&mut status_buf)?;
+    let status = match status_buf[0] {
+        STATUS_DELIVERED => DeliveryStatus::Delivered,
+        STATUS_TEMPORARY => DeliveryStatus::TemporaryFailure,
+        STATUS_PERMANENT => DeliveryStatus::PermanentFailure,
+        STATUS_PROTOCOL => DeliveryStatus::ProtocolRejection,
+        other => return Err(SubmissionError::UnknownFlags(other)),
+    };
+
+    // Ambiguous flag
+    let mut ambiguous_buf = [0u8; 1];
+    r.read_exact(&mut ambiguous_buf)?;
+    let ambiguous = match ambiguous_buf[0] {
+        0 => false,
+        1 => true,
+        other => return Err(SubmissionError::UnknownFlags(other)),
+    };
+
+    // SMTP code (0 ↔ None)
+    let smtp_raw = read_u16(r)?;
+    let smtp_code = if smtp_raw == 0 { None } else { Some(smtp_raw) };
+
+    // Diagnostic (length-prefixed, UTF-8 validated)
+    let diag_len = read_u16(r)? as usize;
+    if diag_len > limits.max_diagnostic_bytes {
+        return Err(SubmissionError::DiagnosticTooLong {
+            len: diag_len,
+            limit: limits.max_diagnostic_bytes,
+        });
+    }
+    let diag_bytes = read_bytes(r, diag_len)?;
+    let diagnostic =
+        String::from_utf8(diag_bytes).map_err(|_| SubmissionError::InvalidDiagnosticUtf8)?;
+
+    Ok(DeliveryResult {
+        status,
+        ambiguous,
+        smtp_code,
+        diagnostic,
+    })
+}
+
+/// Encode a submission response to a writer.
+///
+/// The diagnostic is defensively truncated to `max_diagnostic_bytes` at
+/// a UTF-8 boundary before encoding.
+pub fn write_response<W: Write>(
+    w: &mut W,
+    result: &DeliveryResult,
+    max_diagnostic_bytes: usize,
+) -> Result<(), io::Error> {
+    // Status
+    let status_byte = match result.status {
+        DeliveryStatus::Delivered => STATUS_DELIVERED,
+        DeliveryStatus::TemporaryFailure => STATUS_TEMPORARY,
+        DeliveryStatus::PermanentFailure => STATUS_PERMANENT,
+        DeliveryStatus::ProtocolRejection => STATUS_PROTOCOL,
+    };
+    w.write_all(&[status_byte])?;
+
+    // Ambiguous
+    w.write_all(&[u8::from(result.ambiguous)])?;
+
+    // SMTP code (None → 0)
+    write_u16(w, result.smtp_code.unwrap_or(0))?;
+
+    // Diagnostic (truncate defensively, then encode)
+    let diag = truncate_to_utf8_boundary(&result.diagnostic, max_diagnostic_bytes);
+    write_u16(
+        w,
+        u16::try_from(diag.len()).expect("diagnostic exceeds u16"),
+    )?;
+    w.write_all(diag.as_bytes())?;
+
+    Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    // ── helpers ───────────────────────────────────────────────────────
+
+    /// Build a minimal valid SRL1 request frame for "sender@example.com"
+    /// → ["rcpt@example.net"] with message "hello".
+    fn minimal_valid_frame() -> Vec<u8> {
+        let sender = b"sender@example.com";
+        let rcpt = b"rcpt@example.net";
+        let msg = b"hello";
+
+        let mut frame = Vec::new();
+        // Magic
+        frame.extend_from_slice(MAGIC);
+        // Flags = 0
+        frame.push(FLAGS_V0);
+        // Sender len + data
+        frame.extend_from_slice(&(sender.len() as u16).to_be_bytes());
+        frame.extend_from_slice(sender);
+        // Recipient count = 1
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        // Recipient 0 len + data
+        frame.extend_from_slice(&(rcpt.len() as u16).to_be_bytes());
+        frame.extend_from_slice(rcpt);
+        // Message len + data
+        frame.extend_from_slice(&(msg.len() as u64).to_be_bytes());
+        frame.extend_from_slice(msg);
+
+        frame
+    }
+
+    fn permissive_limits() -> SubmissionLimits {
+        SubmissionLimits::permissive()
+    }
+
+    // ── request round-trip ────────────────────────────────────────────
+
+    #[test]
+    fn request_round_trip() {
+        let frame = minimal_valid_frame();
+        let request = read_request(&mut Cursor::new(&frame), &permissive_limits()).unwrap();
+
+        assert_eq!(request.envelope.sender(), b"sender@example.com");
+        assert_eq!(request.envelope.recipients().len(), 1);
+        assert_eq!(
+            request.envelope.recipients()[0],
+            b"rcpt@example.net".as_slice()
+        );
+        assert_eq!(request.message, b"hello");
+    }
+
+    // ── request encoder round-trip ────────────────────────────────────
+
+    #[test]
+    fn request_encoder_round_trip() {
+        let envelope = Envelope::new(
+            b"alice@example.com",
+            vec![b"bob@example.net".to_vec(), b"carol@example.org".to_vec()],
+        )
+        .unwrap();
+        let request = SubmissionRequest {
+            envelope,
+            message: b"test message body".to_vec(),
+        };
+
+        let mut encoded = Vec::new();
+        write_request(&mut encoded, &request).unwrap();
+
+        let decoded = read_request(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.envelope.sender(), b"alice@example.com");
+        assert_eq!(decoded.envelope.recipients().len(), 2);
+        assert_eq!(
+            decoded.envelope.recipients()[0],
+            b"bob@example.net".as_slice()
+        );
+        assert_eq!(
+            decoded.envelope.recipients()[1],
+            b"carol@example.org".as_slice()
+        );
+        assert_eq!(decoded.message, b"test message body");
+    }
+
+    // ── wrong magic ───────────────────────────────────────────────────
+
+    #[test]
+    fn reject_wrong_magic() {
+        let mut frame = minimal_valid_frame();
+        frame[0] = b'X'; // corrupt first magic byte
+
+        let err = read_request(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::InvalidMagic);
+    }
+
+    // ── unknown flags ─────────────────────────────────────────────────
+
+    #[test]
+    fn reject_unknown_flags() {
+        let mut frame = minimal_valid_frame();
+        frame[4] = 0xFF; // flags byte
+
+        let err = read_request(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::UnknownFlags(0xFF));
+    }
+
+    // ── recipient count over limit ────────────────────────────────────
+
+    #[test]
+    fn reject_recipient_count_over_limit() {
+        let mut limits = permissive_limits();
+        limits.max_recipients = 1;
+
+        // Build a frame declaring 2 recipients.
+        let sender = b"sender@example.com";
+        let rcpt = b"rcpt@example.net";
+        let msg = b"hi";
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.push(FLAGS_V0);
+        frame.extend_from_slice(&(sender.len() as u16).to_be_bytes());
+        frame.extend_from_slice(sender);
+        frame.extend_from_slice(&2u16.to_be_bytes()); // 2 recipients, limit is 1
+                                                      // Add recipient data so the frame isn't truncated (we want the
+                                                      // rejection to happen at count validation, not at read).
+        for _ in 0..2 {
+            frame.extend_from_slice(&(rcpt.len() as u16).to_be_bytes());
+            frame.extend_from_slice(rcpt);
+        }
+        frame.extend_from_slice(&(msg.len() as u64).to_be_bytes());
+        frame.extend_from_slice(msg);
+
+        let err = read_request(&mut Cursor::new(&frame), &limits).unwrap_err();
+        assert_eq!(
+            err,
+            SubmissionError::TooManyRecipients { count: 2, limit: 1 }
+        );
+    }
+
+    // ── oversized message ─────────────────────────────────────────────
+
+    #[test]
+    fn reject_oversized_message() {
+        let mut limits = permissive_limits();
+        limits.max_message_bytes = 4;
+
+        // Build a frame with a message length > 4.
+        let sender = b"sender@example.com";
+        let rcpt = b"rcpt@example.net";
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.push(FLAGS_V0);
+        frame.extend_from_slice(&(sender.len() as u16).to_be_bytes());
+        frame.extend_from_slice(sender);
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&(rcpt.len() as u16).to_be_bytes());
+        frame.extend_from_slice(rcpt);
+        frame.extend_from_slice(&10u64.to_be_bytes()); // 10 bytes, limit is 4
+        frame.extend_from_slice(b"0123456789");
+
+        let err = read_request(&mut Cursor::new(&frame), &limits).unwrap_err();
+        assert_eq!(err, SubmissionError::MessageTooLarge { len: 10, limit: 4 });
+    }
+
+    // ── message u64::MAX rejected via checked conversion ──────────────
+
+    #[test]
+    fn reject_message_u64_max() {
+        let sender = b"sender@example.com";
+        let rcpt = b"rcpt@example.net";
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.push(FLAGS_V0);
+        frame.extend_from_slice(&(sender.len() as u16).to_be_bytes());
+        frame.extend_from_slice(sender);
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&(rcpt.len() as u16).to_be_bytes());
+        frame.extend_from_slice(rcpt);
+        frame.extend_from_slice(&u64::MAX.to_be_bytes()); // u64::MAX
+
+        let err = read_request(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        assert_eq!(
+            err,
+            SubmissionError::MessageTooLarge {
+                len: u64::MAX,
+                limit: permissive_limits().max_message_bytes
+            }
+        );
+    }
+
+    // ── truncation at every fixed and variable field boundary ─────────
+
+    #[test]
+    fn reject_truncation_at_every_field_boundary() {
+        let frame = minimal_valid_frame();
+        // The frame has known structure. Test truncation at every byte
+        // offset from 1..frame.len()-1 (not 0 or full length).
+        for cut in 1..frame.len() {
+            let truncated = &frame[..cut];
+            let result = read_request(&mut Cursor::new(truncated), &permissive_limits());
+            assert!(
+                result.is_err(),
+                "truncation at byte {} should fail, but got Ok",
+                cut
+            );
+            // Verify the error is an I/O error (UnexpectedEof).
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof)),
+                "truncation at byte {}: expected Io(UnexpectedEof), got {:?}",
+                cut,
+                err
+            );
+        }
+    }
+
+    // ── specific truncation boundaries ────────────────────────────────
+
+    #[test]
+    fn reject_truncated_at_magic() {
+        // Only 3 bytes — not enough for the 4-byte magic.
+        let frame = &minimal_valid_frame()[..3];
+        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_truncated_at_flags() {
+        // 4 bytes magic, no flags byte.
+        let frame = &minimal_valid_frame()[..4];
+        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_truncated_at_sender_len() {
+        // 4 magic + 1 flags = 5, need 2 more for sender len.
+        let frame = &minimal_valid_frame()[..6];
+        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_truncated_at_sender_data() {
+        // Declare sender len = 18, but only provide 10 bytes.
+        let full = minimal_valid_frame();
+        // sender_len field is at bytes 5..7, sender data starts at 7.
+        // Truncate mid-sender: 7 + 10 = 17 bytes.
+        let frame = &full[..17];
+        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_truncated_at_rcpt_count() {
+        // After sender (magic 4 + flags 1 + sender_len 2 + sender 18 = 25),
+        // need 2 bytes for rcpt_count.
+        let full = minimal_valid_frame();
+        let frame = &full[..26];
+        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_truncated_at_rcpt_len() {
+        // After rcpt_count (byte 27), need 2 bytes for rcpt[0] len.
+        let full = minimal_valid_frame();
+        let frame = &full[..28];
+        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_truncated_at_rcpt_data() {
+        // After rcpt_len (byte 29), need rcpt[0] data (16 bytes).
+        let full = minimal_valid_frame();
+        let frame = &full[..35]; // mid-recipient
+        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_truncated_at_msg_len() {
+        // After all recipients, need 8 bytes for message length.
+        let full = minimal_valid_frame();
+        let total = full.len(); // 33 for "hello"
+                                // Everything except the last 5 bytes of msg data and 3 of msg_len.
+        let frame = &full[..total - 8]; // remove msg data + some of msg_len
+        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_truncated_at_msg_data() {
+        // Full frame minus last 2 bytes of message.
+        let full = minimal_valid_frame();
+        let frame = &full[..full.len() - 2];
+        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    // ── address limit checked before allocation ───────────────────────
+
+    #[test]
+    fn reject_address_over_limit_before_read() {
+        let mut limits = permissive_limits();
+        limits.max_address_bytes = 10;
+
+        // Build a frame with a recipient declared as 20 bytes.
+        let sender = b"sender@example.com";
+        let long_rcpt = b"very-long-rcpt-address@example.net"; // 34 bytes
+        let msg = b"hi";
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.push(FLAGS_V0);
+        frame.extend_from_slice(&(sender.len() as u16).to_be_bytes());
+        frame.extend_from_slice(sender);
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&(long_rcpt.len() as u16).to_be_bytes());
+        // Don't add the actual recipient data — the limit check happens
+        // after reading the length, before reading the data.
+        // But we do need the data in the frame for it not to be a
+        // truncation error. However, we want to verify the error is
+        // AddressTooLong, not UnexpectedEof.
+        frame.extend_from_slice(long_rcpt);
+        frame.extend_from_slice(&(msg.len() as u64).to_be_bytes());
+        frame.extend_from_slice(msg);
+
+        let err = read_request(&mut Cursor::new(&frame), &limits).unwrap_err();
+        assert_eq!(err, SubmissionError::AddressTooLong { len: 34, limit: 10 });
+    }
+
+    // ── response round-trips ──────────────────────────────────────────
+
+    #[test]
+    fn response_round_trip_delivered() {
+        let result = DeliveryResult::delivered("250 queued", Some(250));
+        let mut encoded = Vec::new();
+        write_response(&mut encoded, &result, 4096).unwrap();
+
+        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.status, DeliveryStatus::Delivered);
+        assert!(!decoded.ambiguous);
+        assert_eq!(decoded.smtp_code, Some(250));
+        assert_eq!(decoded.diagnostic, "250 queued");
+    }
+
+    #[test]
+    fn response_round_trip_temporary_failure() {
+        let result = DeliveryResult::temporary_failure("451 try again", Some(451));
+        let mut encoded = Vec::new();
+        write_response(&mut encoded, &result, 4096).unwrap();
+
+        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.status, DeliveryStatus::TemporaryFailure);
+        assert!(!decoded.ambiguous);
+        assert_eq!(decoded.smtp_code, Some(451));
+        assert_eq!(decoded.diagnostic, "451 try again");
+    }
+
+    #[test]
+    fn response_round_trip_permanent_failure() {
+        let result = DeliveryResult::permanent_failure("550 user unknown", Some(550));
+        let mut encoded = Vec::new();
+        write_response(&mut encoded, &result, 4096).unwrap();
+
+        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.status, DeliveryStatus::PermanentFailure);
+        assert!(!decoded.ambiguous);
+        assert_eq!(decoded.smtp_code, Some(550));
+        assert_eq!(decoded.diagnostic, "550 user unknown");
+    }
+
+    #[test]
+    fn response_round_trip_protocol_rejection() {
+        let result = DeliveryResult::protocol_rejection("TLS handshake failed", None);
+        let mut encoded = Vec::new();
+        write_response(&mut encoded, &result, 4096).unwrap();
+
+        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.status, DeliveryStatus::ProtocolRejection);
+        assert!(!decoded.ambiguous);
+        assert_eq!(decoded.smtp_code, None);
+        assert_eq!(decoded.diagnostic, "TLS handshake failed");
+    }
+
+    // ── ambiguous flag round-trip ─────────────────────────────────────
+
+    #[test]
+    fn response_ambiguous_flag_round_trip() {
+        let result = DeliveryResult::ambiguous("connection lost after DATA");
+        let mut encoded = Vec::new();
+        write_response(&mut encoded, &result, 4096).unwrap();
+
+        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.status, DeliveryStatus::TemporaryFailure);
+        assert!(decoded.ambiguous);
+        assert_eq!(decoded.smtp_code, None);
+        assert_eq!(decoded.diagnostic, "connection lost after DATA");
+    }
+
+    // ── SMTP code 0 ↔ None ───────────────────────────────────────────
+
+    #[test]
+    fn response_smtp_code_zero_is_none() {
+        // Manually build a response frame with smtp_code = 0.
+        let mut frame = Vec::new();
+        frame.push(STATUS_DELIVERED); // status
+        frame.push(0); // not ambiguous
+        frame.extend_from_slice(&0u16.to_be_bytes()); // smtp code = 0
+        frame.extend_from_slice(&5u16.to_be_bytes()); // diag len
+        frame.extend_from_slice(b"hello"); // diagnostic
+
+        let decoded = read_response(&mut Cursor::new(&frame), &permissive_limits()).unwrap();
+        assert_eq!(decoded.smtp_code, None);
+    }
+
+    #[test]
+    fn response_smtp_code_nonzero_round_trip() {
+        let result = DeliveryResult::delivered("ok", Some(250));
+        let mut encoded = Vec::new();
+        write_response(&mut encoded, &result, 4096).unwrap();
+
+        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.smtp_code, Some(250));
+    }
+
+    // ── diagnostic UTF-8 round trip ───────────────────────────────────
+
+    #[test]
+    fn response_diagnostic_utf8_round_trip() {
+        // Multi-byte UTF-8: euro sign (3 bytes) + ASCII.
+        let diag = "price: \u{20AC}100 \u{2013} special chars";
+        let result = DeliveryResult::delivered(diag, Some(250));
+        let mut encoded = Vec::new();
+        write_response(&mut encoded, &result, 4096).unwrap();
+
+        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.diagnostic, diag);
+    }
+
+    // ── invalid UTF-8 rejection ───────────────────────────────────────
+
+    #[test]
+    fn response_reject_invalid_utf8_diagnostic() {
+        // Manually build a response with invalid UTF-8 in diagnostic.
+        let mut frame = Vec::new();
+        frame.push(STATUS_DELIVERED);
+        frame.push(0); // not ambiguous
+        frame.extend_from_slice(&250u16.to_be_bytes());
+        // Diagnostic: 3 bytes of invalid UTF-8.
+        frame.extend_from_slice(&3u16.to_be_bytes());
+        frame.extend_from_slice(&[0xFF, 0xFE, 0x80]); // invalid UTF-8
+
+        let err = read_response(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::InvalidDiagnosticUtf8);
+    }
+
+    // ── diagnostic truncation at UTF-8 boundary to 4096 ──────────────
+
+    #[test]
+    fn response_diagnostic_truncated_at_utf8_boundary() {
+        // 3-byte UTF-8 character (euro sign). 4096 / 3 = 1365 remainder 1.
+        let euro = "\u{20AC}";
+        let long_diag = euro.repeat(2000); // 2000 * 3 = 6000 bytes
+
+        let result = DeliveryResult::delivered(&long_diag, Some(250));
+        // DeliveryResult constructors already truncate to 4096.
+        assert!(result.diagnostic.len() <= 4096);
+
+        // Write and read back.
+        let mut encoded = Vec::new();
+        write_response(&mut encoded, &result, 4096).unwrap();
+
+        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert!(decoded.diagnostic.len() <= 4096);
+        assert!(std::str::from_utf8(decoded.diagnostic.as_bytes()).is_ok());
+        // 4096 / 3 = 1365 full euro chars.
+        assert_eq!(decoded.diagnostic.chars().count(), 4096 / 3);
+    }
+
+    #[test]
+    fn write_response_truncates_oversized_diagnostic() {
+        // Construct a DeliveryResult manually with a too-long diagnostic.
+        let long_diag = "x".repeat(5000);
+        let result = DeliveryResult {
+            status: DeliveryStatus::Delivered,
+            ambiguous: false,
+            smtp_code: Some(250),
+            diagnostic: long_diag,
+        };
+
+        let mut encoded = Vec::new();
+        write_response(&mut encoded, &result, 4096).unwrap();
+
+        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.diagnostic.len(), 4096);
+    }
+
+    // ── diagnostic too long on read ───────────────────────────────────
+
+    #[test]
+    fn reject_diagnostic_too_long_on_read() {
+        let mut limits = permissive_limits();
+        limits.max_diagnostic_bytes = 10;
+
+        // Build a response with a 20-byte diagnostic.
+        let mut frame = Vec::new();
+        frame.push(STATUS_DELIVERED);
+        frame.push(0);
+        frame.extend_from_slice(&250u16.to_be_bytes());
+        frame.extend_from_slice(&20u16.to_be_bytes()); // diag len = 20
+        frame.extend_from_slice(b"twenty bytes long!"); // actually 18, let's use 20
+
+        // Actually, let's build it properly.
+        let mut frame = Vec::new();
+        frame.push(STATUS_DELIVERED);
+        frame.push(0);
+        frame.extend_from_slice(&250u16.to_be_bytes());
+        let diag: &[u8] = b"01234567890123456789"; // 20 bytes exactly
+        frame.extend_from_slice(&20u16.to_be_bytes());
+        frame.extend_from_slice(diag);
+
+        let err = read_response(&mut Cursor::new(&frame), &limits).unwrap_err();
+        assert_eq!(
+            err,
+            SubmissionError::DiagnosticTooLong { len: 20, limit: 10 }
+        );
+    }
+
+    // ── empty message round-trip ──────────────────────────────────────
+
+    #[test]
+    fn request_with_empty_message() {
+        let envelope =
+            Envelope::new(b"sender@example.com", vec![b"rcpt@example.net".to_vec()]).unwrap();
+        let request = SubmissionRequest {
+            envelope,
+            message: Vec::new(),
+        };
+
+        let mut encoded = Vec::new();
+        write_request(&mut encoded, &request).unwrap();
+
+        let decoded = read_request(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.message, b"");
+    }
+
+    // ── null reverse path ─────────────────────────────────────────────
+
+    #[test]
+    fn request_with_null_reverse_path() {
+        let envelope = Envelope::new(b"", vec![b"rcpt@example.net".to_vec()]).unwrap();
+        let request = SubmissionRequest {
+            envelope,
+            message: b"data".to_vec(),
+        };
+
+        let mut encoded = Vec::new();
+        write_request(&mut encoded, &request).unwrap();
+
+        let decoded = read_request(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.envelope.sender(), b"");
+        assert_eq!(
+            decoded.envelope.recipients()[0],
+            b"rcpt@example.net".as_slice()
+        );
+    }
+}

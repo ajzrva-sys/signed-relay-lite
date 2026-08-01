@@ -6,6 +6,7 @@ pub mod config;
 pub mod dkim;
 pub mod message;
 pub mod relay;
+pub mod submission;
 
 #[cfg(test)]
 mod tests {
