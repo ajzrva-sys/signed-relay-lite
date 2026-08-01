@@ -720,7 +720,9 @@ impl SubmissionServer {
 
     /// Accept connections until the shared shutdown flag is set.
     ///
-    /// Every handler is joined before this method returns.
+    /// Every handler is joined before this method returns. Shutdown never
+    /// substitutes a successful result: accepted handlers finish their actual
+    /// parse, signing, and relay path (or its bounded timeout) before joining.
     pub fn run(&self) -> io::Result<()> {
         let mut handlers: Vec<JoinHandle<()>> = Vec::new();
         while !self.shutdown.load(Ordering::Acquire) {

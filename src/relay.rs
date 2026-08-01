@@ -1,5 +1,6 @@
 //! Delivery result types and bounded workers for signed-relay-lite.
 
+use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -110,6 +111,86 @@ impl RelayPool {
             sender: Some(sender),
             workers,
         }
+    }
+
+    /// Construct and validate every worker connection before starting the pool.
+    ///
+    /// The SMTP transport itself remains lazy: connection factories build TLS
+    /// connectors here but do not open network sockets until delivery begins.
+    pub fn try_new<F>(worker_count: usize, queue_capacity: usize, factory: F) -> io::Result<Self>
+    where
+        F: Fn() -> io::Result<SmtpConnection> + Send + Sync + 'static,
+    {
+        if worker_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "relay worker count must be positive",
+            ));
+        }
+        if queue_capacity == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "relay queue capacity must be positive",
+            ));
+        }
+
+        let mut connections = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            connections.push(factory()?);
+        }
+        let (sender, receiver) = mpsc::sync_channel::<DeliveryJob>(queue_capacity);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let factory = Arc::new(factory);
+        let workers = connections
+            .into_iter()
+            .map(|initial| {
+                let receiver = Arc::clone(&receiver);
+                let factory = Arc::clone(&factory);
+                thread::spawn(move || {
+                    let mut connection = Some(initial);
+                    loop {
+                        let job = match receiver.lock() {
+                            Ok(receiver) => receiver.recv(),
+                            Err(_) => return,
+                        };
+                        let Ok(job) = job else { return };
+                        if connection.is_none() {
+                            match factory() {
+                                Ok(replacement) => connection = Some(replacement),
+                                Err(error) => {
+                                    let _ = job.result_tx.send(DeliveryResult::temporary_failure(
+                                        format!("cannot rebuild SMTP connection: {error}"),
+                                        None,
+                                    ));
+                                    continue;
+                                }
+                            }
+                        }
+                        let result = catch_unwind(AssertUnwindSafe(|| {
+                            connection
+                                .as_mut()
+                                .expect("connection initialized")
+                                .deliver(&job.envelope, &job.signature, job.message.as_bytes())
+                        }));
+                        let result = match result {
+                            Ok(result) => result,
+                            Err(_) => {
+                                connection = None;
+                                DeliveryResult::temporary_failure(
+                                    "SMTP delivery worker panicked",
+                                    None,
+                                )
+                            }
+                        };
+                        let _ = job.result_tx.send(result);
+                    }
+                })
+            })
+            .collect();
+        Ok(Self {
+            sender: Some(sender),
+            workers,
+        })
     }
 
     /// Enqueue a job, blocking while the bounded queue is full.
@@ -354,6 +435,25 @@ fn validate_address(addr: &[u8]) -> Result<(), EnvelopeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn fallible_pool_preinitializes_every_worker_or_starts_none() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::clone(&calls);
+        let result = RelayPool::try_new(3, 2, move || {
+            let call = factory_calls.fetch_add(1, Ordering::Relaxed);
+            if call == 1 {
+                Err(io::Error::other("connector failed"))
+            } else {
+                Ok(SmtpConnection::new("test", || {
+                    Err(io::Error::new(io::ErrorKind::ConnectionRefused, "unused"))
+                }))
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
 
     // -- constructors ---------------------------------------------------
 

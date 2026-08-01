@@ -44,6 +44,11 @@ impl Secret {
         Self(bytes)
     }
 
+    /// Make an independently owned, zero-on-drop copy for one relay worker.
+    pub fn duplicate(&self) -> Self {
+        Self(self.0.clone())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.0
