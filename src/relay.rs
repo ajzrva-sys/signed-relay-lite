@@ -202,7 +202,7 @@ fn validate_address(addr: &[u8]) -> Result<(), EnvelopeError> {
     }
     for &b in addr {
         // Reject anything outside printable ASCII range 0x20..=0x7E.
-        if b < 0x20 || b > 0x7E {
+        if !(0x20..=0x7E).contains(&b) {
             return Err(EnvelopeError::InvalidCharacter {
                 addr: addr.to_vec(),
                 byte: b,

@@ -215,7 +215,7 @@ mod tests {
         // Single-byte chunks
         let single_bytes: Vec<&[u8]> = b" C \r\nD \t E\r\n\r\n"
             .iter()
-            .map(|b| std::slice::from_ref(b))
+            .map(std::slice::from_ref)
             .collect();
         assert_eq!(full, body(&single_bytes));
     }
