@@ -24,6 +24,7 @@
 //! ```
 
 use std::io::{self, Read, Write};
+use std::sync::{Arc, Mutex};
 
 use crate::relay::{DeliveryResult, DeliveryStatus, Envelope, EnvelopeError};
 
@@ -111,6 +112,8 @@ pub enum SubmissionError {
     Io(io::ErrorKind),
     /// Envelope construction validation failed.
     Envelope(EnvelopeError),
+    /// The global memory budget cannot accommodate the declared message size.
+    BudgetExhausted { requested: usize, capacity: usize },
 }
 
 impl From<io::Error> for SubmissionError {
@@ -125,6 +128,91 @@ impl From<EnvelopeError> for SubmissionError {
     }
 }
 
+// ── Memory budget ──────────────────────────────────────────────────
+
+/// RAII guard that holds `bytes` reserved from a [`MemoryBudget`].
+///
+/// On drop the reserved bytes are returned to the budget. The guard
+/// is *not* cloneable — moving it transfers ownership of the
+/// reservation; cloning would cause a double-release.
+pub struct MemoryReservation {
+    inner: Arc<Mutex<usize>>,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for MemoryReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryReservation")
+            .field("bytes", &self.bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for MemoryReservation {
+    fn drop(&mut self) {
+        let mut used = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *used = used.saturating_sub(self.bytes);
+    }
+}
+
+/// A global, thread-safe memory budget for retained message payloads.
+///
+/// The budget bounds the total bytes of in-flight messages regardless
+/// of connection count. It is backed by `Arc<Mutex<usize>>` so
+/// reservations can be shared across threads.
+#[derive(Clone, Debug)]
+pub struct MemoryBudget {
+    inner: Arc<Mutex<usize>>,
+    capacity: usize,
+}
+
+impl MemoryBudget {
+    /// Create a new budget allowing up to `capacity` bytes.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(0)),
+            capacity,
+        }
+    }
+
+    /// Try to reserve `bytes` from the budget.
+    ///
+    /// Returns `Some(MemoryReservation)` on success, or `None` if the
+    /// reservation would exceed capacity **or** would cause a
+    /// checked-add overflow (defending against `usize::MAX` attacks).
+    pub fn try_reserve(&self, bytes: usize) -> Option<MemoryReservation> {
+        let mut used = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let new_total = used.checked_add(bytes)?;
+        if new_total > self.capacity {
+            return None;
+        }
+        *used = new_total;
+        Some(MemoryReservation {
+            inner: Arc::clone(&self.inner),
+            bytes,
+        })
+    }
+
+    /// Current bytes in use (snapshot; may change immediately after).
+    pub fn used(&self) -> usize {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Total capacity of this budget.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
 // ── Decoded request ───────────────────────────────────────────────────
 
 /// A decoded submission request.
@@ -132,10 +220,28 @@ impl From<EnvelopeError> for SubmissionError {
 /// The message bytes are kept raw (not parsed) — message parsing happens
 /// later in the pipeline. The `Envelope` is constructed through
 /// validation.
+///
+/// Holds an RAII [`MemoryReservation`] for the message bytes; when the
+/// request is dropped the reservation is returned to the global budget.
 #[derive(Debug)]
 pub struct SubmissionRequest {
     pub envelope: Envelope,
     pub message: Vec<u8>,
+    /// RAII reservation for the message bytes — private to prevent
+    /// external code from releasing it prematurely. Its sole purpose
+    /// is the `Drop` impl that returns bytes to the budget.
+    #[allow(dead_code)]
+    reservation: MemoryReservation,
+}
+
+impl SubmissionRequest {
+    /// Take the request apart while preserving its memory reservation.
+    ///
+    /// The caller must retain the returned guard for at least as long as
+    /// the message bytes remain allocated.
+    pub fn into_parts(self) -> (Envelope, Vec<u8>, MemoryReservation) {
+        (self.envelope, self.message, self.reservation)
+    }
 }
 
 // ── Wire helpers ──────────────────────────────────────────────────────
@@ -226,9 +332,15 @@ fn truncate_to_utf8_boundary(s: &str, max: usize) -> &str {
 /// All lengths are validated against `limits` *before* allocating the
 /// corresponding buffer. Envelope addresses are validated through
 /// `Envelope::new`.
+///
+/// A `MemoryReservation` is acquired from `budget` *after* the message
+/// length is validated against `limits` but *before* the message bytes
+/// are read/allocated.  The reservation is held inside the returned
+/// [`SubmissionRequest`] and released when it is dropped.
 pub fn read_request<R: Read>(
     r: &mut R,
     limits: &SubmissionLimits,
+    budget: &MemoryBudget,
 ) -> Result<SubmissionRequest, SubmissionError> {
     // Magic (4 bytes)
     let mut magic = [0u8; 4];
@@ -277,12 +389,27 @@ pub fn read_request<R: Read>(
 
     // Message length (u64 BE, checked conversion to usize)
     let msg_len = read_message_len(r, limits.max_message_bytes)?;
+
+    // Budget reservation: acquired *after* length validation but
+    // *before* the message bytes are allocated/read.  This is the
+    // point where we commit to holding `msg_len` bytes.
+    let reservation = budget
+        .try_reserve(msg_len)
+        .ok_or(SubmissionError::BudgetExhausted {
+            requested: msg_len,
+            capacity: budget.capacity(),
+        })?;
+
     let message = read_bytes(r, msg_len)?;
 
     // Construct envelope through validation.
     let envelope = Envelope::new(&sender, recipients)?;
 
-    Ok(SubmissionRequest { envelope, message })
+    Ok(SubmissionRequest {
+        envelope,
+        message,
+        reservation,
+    })
 }
 
 /// Encode a submission request to a writer.
@@ -472,12 +599,223 @@ mod tests {
         SubmissionLimits::permissive()
     }
 
+    fn permissive_budget() -> MemoryBudget {
+        MemoryBudget::new(usize::MAX / 2)
+    }
+
+    // ── MemoryBudget RED tests ────────────────────────────────────────
+
+    #[test]
+    fn reservation_is_released_on_drop() {
+        let budget = MemoryBudget::new(100);
+        let first = budget.try_reserve(80).unwrap();
+        assert!(budget.try_reserve(21).is_none());
+        drop(first);
+        assert!(budget.try_reserve(100).is_some());
+    }
+
+    #[test]
+    fn zero_reservation_succeeds() {
+        let budget = MemoryBudget::new(100);
+        let r = budget.try_reserve(0).unwrap();
+        assert_eq!(budget.used(), 0);
+        drop(r);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn exact_limit_succeeds() {
+        let budget = MemoryBudget::new(100);
+        let r = budget.try_reserve(100).unwrap();
+        assert_eq!(budget.used(), 100);
+        drop(r);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn one_over_rejected() {
+        let budget = MemoryBudget::new(100);
+        assert!(budget.try_reserve(101).is_none());
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn checked_add_overflow_rejected() {
+        let budget = MemoryBudget::new(usize::MAX);
+        let _r = budget.try_reserve(usize::MAX).unwrap();
+        // second reservation would overflow usize — must return None, not panic
+        assert!(budget.try_reserve(1).is_none());
+    }
+
+    #[test]
+    fn poisoned_budget_lock_recovers_without_panicking() {
+        use std::thread;
+
+        let budget = MemoryBudget::new(100);
+        let poisoned = budget.clone();
+        let _ = thread::spawn(move || {
+            let _guard = poisoned.inner.lock().unwrap();
+            panic!("poison budget lock for recovery test");
+        })
+        .join();
+
+        let reservation = budget.try_reserve(40).unwrap();
+        assert_eq!(budget.used(), 40);
+        drop(reservation);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn concurrent_reservations_never_exceed_budget() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let budget = MemoryBudget::new(1000);
+        let barrier = Arc::new(Barrier::new(21));
+        let handles: Vec<_> = (0..20)
+            .map(|_| {
+                let b = budget.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let reservation = b.try_reserve(100);
+                    // Every thread attempts exactly once, then all wait while
+                    // successful guards are still alive. This makes the test
+                    // about simultaneous reservations rather than scheduling.
+                    barrier.wait();
+                    reservation
+                })
+            })
+            .collect();
+        barrier.wait();
+
+        let mut successes = 0;
+        for h in handles {
+            if h.join().unwrap().is_some() {
+                successes += 1;
+            }
+        }
+        // At most 10 threads (10 × 100 = 1000) can hold a reservation.
+        assert!(successes <= 10);
+        // After all threads finish, all reservations are released.
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn drop_releases_exactly_once() {
+        let budget = MemoryBudget::new(100);
+        {
+            let _r1 = budget.try_reserve(30).unwrap();
+            let _r2 = budget.try_reserve(40).unwrap();
+            assert_eq!(budget.used(), 70);
+        }
+        // Both dropped — back to zero.
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn moving_reservation_transfers_ownership() {
+        let budget = MemoryBudget::new(100);
+        let r = budget.try_reserve(50).unwrap();
+        assert_eq!(budget.used(), 50);
+        // Move into a function — original `r` is consumed.
+        let moved = move_reservation(r);
+        assert_eq!(budget.used(), 50); // still held
+        drop(moved);
+        assert_eq!(budget.used(), 0); // released exactly once
+    }
+
+    fn move_reservation(r: MemoryReservation) -> MemoryReservation {
+        r // move, not copy
+    }
+
+    // ── Budget integration into read_request ─────────────────────────
+
+    #[test]
+    fn budget_exhaustion_rejects_before_reading_message() {
+        // Budget too small for the message declared in the frame.
+        let budget = MemoryBudget::new(3); // only 3 bytes
+        let frame = minimal_valid_frame(); // message is "hello" = 5 bytes
+        let err =
+            read_request(&mut Cursor::new(&frame), &permissive_limits(), &budget).unwrap_err();
+        assert_eq!(
+            err,
+            SubmissionError::BudgetExhausted {
+                requested: 5,
+                capacity: 3,
+            }
+        );
+        // Budget was never touched — reservation was rejected.
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn truncated_message_releases_reservation() {
+        // Build a frame with message length = 100 but only provide 10 bytes of data.
+        // The budget reservation succeeds (length is valid) but the read
+        // of message bytes fails with UnexpectedEof, and the reservation
+        // must be released.
+        let budget = MemoryBudget::new(1000);
+        let sender = b"a@b";
+        let rcpt = b"c@d";
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame.extend_from_slice(&(sender.len() as u32).to_be_bytes());
+        frame.extend_from_slice(sender);
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&(rcpt.len() as u32).to_be_bytes());
+        frame.extend_from_slice(rcpt);
+        frame.extend_from_slice(&100u64.to_be_bytes()); // declare 100 bytes
+        frame.extend_from_slice(&[0u8; 10]); // but only provide 10
+
+        let err =
+            read_request(&mut Cursor::new(&frame), &permissive_limits(), &budget).unwrap_err();
+        assert!(matches!(
+            err,
+            SubmissionError::Io(io::ErrorKind::UnexpectedEof)
+        ));
+        // The reservation must have been released on error.
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn successful_read_holds_reservation_until_drop() {
+        let budget = MemoryBudget::new(1000);
+        let frame = minimal_valid_frame(); // message "hello" = 5 bytes
+        let request =
+            read_request(&mut Cursor::new(&frame), &permissive_limits(), &budget).unwrap();
+        assert_eq!(budget.used(), 5);
+        assert_eq!(request.message.len(), 5);
+        drop(request);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn into_parts_keeps_reservation_while_message_is_retained() {
+        let budget = MemoryBudget::new(1000);
+        let frame = minimal_valid_frame();
+        let request =
+            read_request(&mut Cursor::new(&frame), &permissive_limits(), &budget).unwrap();
+        assert_eq!(budget.used(), 5);
+        let (envelope, message, reservation) = request.into_parts();
+        assert_eq!(envelope.sender(), b"sender@example.com");
+        assert_eq!(message, b"hello");
+        assert_eq!(budget.used(), 5);
+        drop(reservation);
+        assert_eq!(budget.used(), 0);
+    }
+
     // ── request round-trip ────────────────────────────────────────────
 
     #[test]
     fn request_round_trip() {
         let frame = minimal_valid_frame();
-        let request = read_request(&mut Cursor::new(&frame), &permissive_limits()).unwrap();
+        let request = read_request(
+            &mut Cursor::new(&frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap();
 
         assert_eq!(request.envelope.sender(), b"sender@example.com");
         assert_eq!(request.envelope.recipients().len(), 1);
@@ -497,15 +835,24 @@ mod tests {
             vec![b"bob@example.net".to_vec(), b"carol@example.org".to_vec()],
         )
         .unwrap();
+        let msg = b"test message body".to_vec();
+        let budget = permissive_budget();
+        let reservation = budget.try_reserve(msg.len()).unwrap();
         let request = SubmissionRequest {
             envelope,
-            message: b"test message body".to_vec(),
+            message: msg,
+            reservation,
         };
 
         let mut encoded = Vec::new();
         write_request(&mut encoded, &request).unwrap();
 
-        let decoded = read_request(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        let decoded = read_request(
+            &mut Cursor::new(&encoded),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap();
         assert_eq!(decoded.envelope.sender(), b"alice@example.com");
         assert_eq!(decoded.envelope.recipients().len(), 2);
         assert_eq!(
@@ -526,7 +873,12 @@ mod tests {
         let mut frame = minimal_valid_frame();
         frame[0] = b'X'; // corrupt first magic byte
 
-        let err = read_request(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(&frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(err, SubmissionError::InvalidMagic);
     }
 
@@ -538,7 +890,12 @@ mod tests {
         // flags are at bytes 4..8 (u32 BE), set byte 7 = 0xFF
         frame[7] = 0xFF;
 
-        let err = read_request(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(&frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(err, SubmissionError::UnknownRequestFlags(0xFF));
     }
 
@@ -569,7 +926,8 @@ mod tests {
         frame.extend_from_slice(&(msg.len() as u64).to_be_bytes());
         frame.extend_from_slice(msg);
 
-        let err = read_request(&mut Cursor::new(&frame), &limits).unwrap_err();
+        let err =
+            read_request(&mut Cursor::new(&frame), &limits, &permissive_budget()).unwrap_err();
         assert_eq!(
             err,
             SubmissionError::TooManyRecipients { count: 2, limit: 1 }
@@ -598,7 +956,8 @@ mod tests {
         frame.extend_from_slice(&10u64.to_be_bytes()); // 10 bytes, limit is 4
         frame.extend_from_slice(b"0123456789");
 
-        let err = read_request(&mut Cursor::new(&frame), &limits).unwrap_err();
+        let err =
+            read_request(&mut Cursor::new(&frame), &limits, &permissive_budget()).unwrap_err();
         assert_eq!(err, SubmissionError::MessageTooLarge { len: 10, limit: 4 });
     }
 
@@ -619,7 +978,12 @@ mod tests {
         frame.extend_from_slice(rcpt);
         frame.extend_from_slice(&u64::MAX.to_be_bytes()); // u64::MAX
 
-        let err = read_request(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(&frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             SubmissionError::MessageTooLarge {
@@ -638,7 +1002,11 @@ mod tests {
         // offset from 1..frame.len()-1 (not 0 or full length).
         for cut in 1..frame.len() {
             let truncated = &frame[..cut];
-            let result = read_request(&mut Cursor::new(truncated), &permissive_limits());
+            let result = read_request(
+                &mut Cursor::new(truncated),
+                &permissive_limits(),
+                &permissive_budget(),
+            );
             assert!(
                 result.is_err(),
                 "truncation at byte {} should fail, but got Ok",
@@ -661,7 +1029,12 @@ mod tests {
     fn reject_truncated_at_magic() {
         // Only 3 bytes — not enough for the 4-byte magic.
         let frame = &minimal_valid_frame()[..3];
-        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
@@ -669,7 +1042,12 @@ mod tests {
     fn reject_truncated_at_flags() {
         // 4 bytes magic, no flags.
         let frame = &minimal_valid_frame()[..4];
-        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
@@ -677,7 +1055,12 @@ mod tests {
     fn reject_truncated_at_sender_len() {
         // 4 magic + 4 flags = 8, need 4 more for sender len.
         let frame = &minimal_valid_frame()[..9];
-        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
@@ -688,7 +1071,12 @@ mod tests {
         // sender_len field is at bytes 8..12, sender data starts at 12.
         // Truncate mid-sender: 12 + 10 = 22 bytes.
         let frame = &full[..22];
-        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
@@ -698,7 +1086,12 @@ mod tests {
         // need 4 bytes for rcpt_count.
         let full = minimal_valid_frame();
         let frame = &full[..32];
-        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
@@ -707,7 +1100,12 @@ mod tests {
         // After rcpt_count (byte 34), need 4 bytes for rcpt[0] len.
         let full = minimal_valid_frame();
         let frame = &full[..36];
-        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
@@ -716,7 +1114,12 @@ mod tests {
         // After rcpt_len (byte 38), need rcpt[0] data (16 bytes).
         let full = minimal_valid_frame();
         let frame = &full[..45]; // mid-recipient
-        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
@@ -727,7 +1130,12 @@ mod tests {
         let total = full.len(); // 67 for "hello"
                                 // Remove msg data + some of msg_len.
         let frame = &full[..total - 8];
-        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
@@ -736,7 +1144,12 @@ mod tests {
         // Full frame minus last 2 bytes of message.
         let full = minimal_valid_frame();
         let frame = &full[..full.len() - 2];
-        let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
@@ -768,7 +1181,8 @@ mod tests {
         frame.extend_from_slice(&(msg.len() as u64).to_be_bytes());
         frame.extend_from_slice(msg);
 
-        let err = read_request(&mut Cursor::new(&frame), &limits).unwrap_err();
+        let err =
+            read_request(&mut Cursor::new(&frame), &limits, &permissive_budget()).unwrap_err();
         assert_eq!(err, SubmissionError::AddressTooLong { len: 34, limit: 20 });
     }
 
@@ -794,7 +1208,8 @@ mod tests {
         frame.extend_from_slice(&(msg.len() as u64).to_be_bytes());
         frame.extend_from_slice(msg);
 
-        let err = read_request(&mut Cursor::new(&frame), &limits).unwrap_err();
+        let err =
+            read_request(&mut Cursor::new(&frame), &limits, &permissive_budget()).unwrap_err();
         assert_eq!(err, SubmissionError::AddressTooLong { len: 18, limit: 5 });
     }
 
@@ -811,7 +1226,12 @@ mod tests {
         frame.extend_from_slice(sender);
         frame.extend_from_slice(&u32::MAX.to_be_bytes()); // u32::MAX recipients
 
-        let err = read_request(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        let err = read_request(
+            &mut Cursor::new(&frame),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap_err();
         assert_eq!(
             err,
             SubmissionError::TooManyRecipients {
@@ -1020,15 +1440,23 @@ mod tests {
     fn request_with_empty_message() {
         let envelope =
             Envelope::new(b"sender@example.com", vec![b"rcpt@example.net".to_vec()]).unwrap();
+        let budget = permissive_budget();
+        let reservation = budget.try_reserve(0).unwrap();
         let request = SubmissionRequest {
             envelope,
             message: Vec::new(),
+            reservation,
         };
 
         let mut encoded = Vec::new();
         write_request(&mut encoded, &request).unwrap();
 
-        let decoded = read_request(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        let decoded = read_request(
+            &mut Cursor::new(&encoded),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap();
         assert_eq!(decoded.message, b"");
     }
 
@@ -1037,15 +1465,24 @@ mod tests {
     #[test]
     fn request_with_null_reverse_path() {
         let envelope = Envelope::new(b"", vec![b"rcpt@example.net".to_vec()]).unwrap();
+        let msg = b"data".to_vec();
+        let budget = permissive_budget();
+        let reservation = budget.try_reserve(msg.len()).unwrap();
         let request = SubmissionRequest {
             envelope,
-            message: b"data".to_vec(),
+            message: msg,
+            reservation,
         };
 
         let mut encoded = Vec::new();
         write_request(&mut encoded, &request).unwrap();
 
-        let decoded = read_request(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        let decoded = read_request(
+            &mut Cursor::new(&encoded),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap();
         assert_eq!(decoded.envelope.sender(), b"");
         assert_eq!(
             decoded.envelope.recipients()[0],
@@ -1078,9 +1515,12 @@ mod tests {
 
         // Write via codec
         let envelope = Envelope::new(sender, vec![rcpt.to_vec()]).unwrap();
+        let budget = permissive_budget();
+        let reservation = budget.try_reserve(msg.len()).unwrap();
         let req = SubmissionRequest {
             envelope,
             message: msg.to_vec(),
+            reservation,
         };
         let mut written = Vec::new();
         write_request(&mut written, &req).unwrap();
@@ -1090,7 +1530,12 @@ mod tests {
             "write_request must produce exact spec bytes"
         );
         // read_request must also accept these exact bytes
-        let decoded = read_request(&mut Cursor::new(&expected), &permissive_limits()).unwrap();
+        let decoded = read_request(
+            &mut Cursor::new(&expected),
+            &permissive_limits(),
+            &permissive_budget(),
+        )
+        .unwrap();
         assert_eq!(decoded.envelope.sender(), sender);
     }
 
