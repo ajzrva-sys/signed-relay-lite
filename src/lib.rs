@@ -2,6 +2,8 @@
 //!
 //! All public modules will be declared here.
 
+pub mod relay;
+
 #[cfg(test)]
 mod tests {
     #[test]
