@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use common::{ClosePoint, FakeSmarthost, ServerResult, SmarthostConfig};
 use signed_relay_lite::relay::{DeliveryResult, DeliveryStatus, Envelope};
-use signed_relay_lite::smtp::deliver;
+use signed_relay_lite::smtp::{deliver, SmtpConnection, SmtpStream};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -30,6 +30,180 @@ fn run_delivery(
     let result = deliver(stream, client_name, envelope, dkim_signature, message);
     let server_result = server.join();
     (result, server_result)
+}
+
+fn persistent_connection(server: &FakeSmarthost) -> SmtpConnection {
+    let addr = server.addr;
+    SmtpConnection::new("test-client", move || {
+        let stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(TIMEOUT))?;
+        stream.set_write_timeout(Some(TIMEOUT))?;
+        Ok(Box::new(stream) as SmtpStream)
+    })
+}
+
+#[test]
+fn two_messages_reuse_one_connection_and_one_ehlo() {
+    let server = FakeSmarthost::start(SmarthostConfig::default());
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+    let mut connection = persistent_connection(&server);
+
+    assert!(connection
+        .deliver(&envelope, b"one", b"first\r\n")
+        .is_accepted());
+    assert!(connection
+        .deliver(&envelope, b"two", b"second\r\n")
+        .is_accepted());
+    drop(connection);
+    let result = server.join();
+
+    assert_eq!(result.accepted_connections, 1);
+    assert_eq!(
+        result
+            .commands
+            .iter()
+            .filter(|line| line.starts_with(b"EHLO "))
+            .count(),
+        1
+    );
+    assert_eq!(result.captured_messages.len(), 2);
+}
+
+#[test]
+fn stale_reused_transport_reconnects_once_before_data() {
+    let first = SmarthostConfig {
+        close_point: ClosePoint::BeforeMailReply(1),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start_connections(vec![first, SmarthostConfig::default()]);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+    let mut connection = persistent_connection(&server);
+
+    assert!(connection
+        .deliver(&envelope, b"one", b"first\r\n")
+        .is_accepted());
+    assert!(connection
+        .deliver(&envelope, b"two", b"second\r\n")
+        .is_accepted());
+    drop(connection);
+    let result = server.join();
+
+    assert_eq!(result.accepted_connections, 2);
+    assert_eq!(
+        result
+            .commands
+            .iter()
+            .filter(|line| line.starts_with(b"EHLO "))
+            .count(),
+        2
+    );
+    assert_eq!(result.captured_messages.len(), 2);
+}
+
+#[test]
+fn failure_after_354_does_not_reconnect() {
+    let first = SmarthostConfig {
+        close_point: ClosePoint::AfterFinalDot,
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start_connections(vec![first]);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+    let mut connection = persistent_connection(&server);
+
+    let delivery = connection.deliver(&envelope, b"sig", b"message\r\n");
+    drop(connection);
+    let result = server.join();
+    assert!(delivery.ambiguous);
+    assert_eq!(result.accepted_connections, 1);
+}
+
+#[test]
+fn second_pre_data_transport_failure_stops_without_looping() {
+    let first = SmarthostConfig {
+        close_point: ClosePoint::BeforeMailReply(0),
+        ..SmarthostConfig::default()
+    };
+    let second = first.clone();
+    let server = FakeSmarthost::start_connections(vec![first, second]);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+    let mut connection = persistent_connection(&server);
+
+    let delivery = connection.deliver(&envelope, b"sig", b"message\r\n");
+    drop(connection);
+    let result = server.join();
+    assert_eq!(delivery.status, DeliveryStatus::TemporaryFailure);
+    assert_eq!(result.accepted_connections, 2);
+}
+#[test]
+fn reply_221_marks_session_unusable() {
+    let first = SmarthostConfig {
+        mail_from_response: b"221 closing\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start_connections(vec![first, SmarthostConfig::default()]);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+    let mut connection = persistent_connection(&server);
+
+    let rejected = connection.deliver(&envelope, b"one", b"first\r\n");
+    assert!(!rejected.is_accepted());
+    assert!(connection
+        .deliver(&envelope, b"two", b"second\r\n")
+        .is_accepted());
+    drop(connection);
+    let result = server.join();
+    assert_eq!(result.accepted_connections, 2);
+}
+
+#[test]
+fn rcpt_221_stops_transaction_and_marks_session_unusable() {
+    let first = SmarthostConfig {
+        rcpt_responses: vec![b"221 closing\r\n".to_vec()],
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start_connections(vec![first, SmarthostConfig::default()]);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+    let mut connection = persistent_connection(&server);
+
+    let rejected = connection.deliver(&envelope, b"one", b"first\r\n");
+    assert!(!rejected.is_accepted());
+    assert!(connection
+        .deliver(&envelope, b"two", b"second\r\n")
+        .is_accepted());
+    drop(connection);
+    let result = server.join();
+
+    assert_eq!(result.accepted_connections, 2);
+    assert_eq!(
+        result
+            .commands
+            .iter()
+            .filter(|line| line.as_slice() == b"DATA\r\n")
+            .count(),
+        1,
+        "the connection that returned 221 must not receive DATA"
+    );
+}
+
+#[test]
+fn smtp_rejection_is_not_automatically_retried() {
+    let server = FakeSmarthost::start(SmarthostConfig {
+        mail_from_response: b"451 later\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    });
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+    let mut connection = persistent_connection(&server);
+    let delivery = connection.deliver(&envelope, b"sig", b"message\r\n");
+    drop(connection);
+    let result = server.join();
+    assert_eq!(delivery.smtp_code, Some(451));
+    assert_eq!(result.accepted_connections, 1);
 }
 
 // ── Test 1: Read 220 greeting and send exact EHLO ────────────────────

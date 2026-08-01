@@ -30,6 +30,10 @@ pub struct ServerResult {
     /// The unstuffed message bytes captured during DATA (no trailing
     /// `\\r\\n.\\r\\n`).
     pub captured_message: Vec<u8>,
+    /// One unstuffed message per completed DATA transaction.
+    pub captured_messages: Vec<Vec<u8>>,
+    /// Number of TCP connections accepted by the fake.
+    pub accepted_connections: usize,
 }
 
 /// Where the server should silently drop the connection.
@@ -47,6 +51,8 @@ pub enum ClosePoint {
     AfterFinalDot,
     /// Close after sending the final `250` response.
     AfterDataReply,
+    /// Close before replying to the numbered MAIL command (zero based).
+    BeforeMailReply(usize),
 }
 
 /// Configuration for the fake smarthost's reply behaviour.
@@ -88,18 +94,31 @@ impl Default for SmarthostConfig {
 impl FakeSmarthost {
     /// Start the fake smarthost on an ephemeral port.
     pub fn start(config: SmarthostConfig) -> Self {
+        Self::start_connections(vec![config])
+    }
+
+    /// Start a server with one script for each connection it should accept.
+    pub fn start_connections(configs: Vec<SmarthostConfig>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind failed");
         let addr = listener.local_addr().expect("local_addr failed");
 
         let handle = thread::spawn(move || {
-            let (stream, _peer) = listener.accept().expect("accept failed");
-            stream
-                .set_read_timeout(Some(TEST_TIMEOUT))
-                .expect("set_read_timeout");
-            stream
-                .set_write_timeout(Some(TEST_TIMEOUT))
-                .expect("set_write_timeout");
-            run_server(stream, &config)
+            let mut combined = ServerResult::default();
+            for config in configs {
+                let (stream, _peer) = listener.accept().expect("accept failed");
+                stream
+                    .set_read_timeout(Some(TEST_TIMEOUT))
+                    .expect("set_read_timeout");
+                stream
+                    .set_write_timeout(Some(TEST_TIMEOUT))
+                    .expect("set_write_timeout");
+                let result = run_server(stream, &config);
+                combined.accepted_connections += 1;
+                combined.commands.extend(result.commands);
+                combined.captured_message.extend(result.captured_message);
+                combined.captured_messages.extend(result.captured_messages);
+            }
+            combined
         });
 
         FakeSmarthost {
@@ -172,6 +191,8 @@ fn run_server(stream: TcpStream, config: &SmarthostConfig) -> ServerResult {
 
     let mut rcpt_idx: usize = 0;
     let mut in_data = false;
+    let mut current_message = Vec::new();
+    let mut mail_idx = 0;
 
     loop {
         let line = match read_crlf_line(&mut reader) {
@@ -188,6 +209,9 @@ fn run_server(stream: TcpStream, config: &SmarthostConfig) -> ServerResult {
                 }
                 writer.write_all(&config.data_final_response).unwrap();
                 writer.flush().unwrap();
+                result
+                    .captured_messages
+                    .push(std::mem::take(&mut current_message));
                 in_data = false;
                 if config.close_point == ClosePoint::AfterDataReply {
                     break;
@@ -197,8 +221,10 @@ fn run_server(stream: TcpStream, config: &SmarthostConfig) -> ServerResult {
             // Dot-unstuff: strip a single leading dot.
             if line.len() >= 2 && line[0] == b'.' && line[1] == b'.' {
                 result.captured_message.extend_from_slice(&line[1..]);
+                current_message.extend_from_slice(&line[1..]);
             } else {
                 result.captured_message.extend_from_slice(&line);
+                current_message.extend_from_slice(&line);
             }
             if config.close_point == ClosePoint::DuringData {
                 break;
@@ -213,8 +239,12 @@ fn run_server(stream: TcpStream, config: &SmarthostConfig) -> ServerResult {
             writer.write_all(&config.ehlo_response).unwrap();
             writer.flush().unwrap();
         } else if line.starts_with(b"MAIL FROM:") {
+            if config.close_point == ClosePoint::BeforeMailReply(mail_idx) {
+                break;
+            }
             writer.write_all(&config.mail_from_response).unwrap();
             writer.flush().unwrap();
+            mail_idx += 1;
         } else if line.starts_with(b"RCPT TO:") {
             let resp = config
                 .rcpt_responses

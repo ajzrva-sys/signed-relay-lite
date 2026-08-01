@@ -319,6 +319,8 @@ impl<T: Read + Write> ReadWrite for T {}
 /// Concrete boxed stream type for SMTP delivery.
 pub type SmtpStream = Box<dyn ReadWrite + Send>;
 
+type StreamConnector = Box<dyn FnMut() -> io::Result<SmtpStream> + Send>;
+
 // ── Delivery state machine ────────────────────────────────────────────
 
 /// Maximum line length for SMTP reply parsing during delivery.
@@ -401,133 +403,284 @@ pub fn deliver(
     dkim_signature: &[u8],
     message: &[u8],
 ) -> DeliveryResult {
-    // Split into independent reader / writer halves.
-    let read_stream = stream.try_clone().expect("TcpStream::try_clone failed");
-    let mut reader = io::BufReader::new(read_stream);
-    let mut writer = stream;
+    let mut stream = Some(stream);
+    let mut connection = SmtpConnection::new(client_name, move || {
+        stream
+            .take()
+            .map(|stream| Box::new(stream) as SmtpStream)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "stream unavailable"))
+    });
+    connection.deliver(envelope, dkim_signature, message)
+}
 
-    // 1. Read greeting (220).
-    let greeting = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
-        Ok(r) => r,
-        Err(e) => {
-            return DeliveryResult::temporary_failure(format!("greeting: {e:?}"), None);
+struct AttemptOutcome {
+    result: DeliveryResult,
+    retry_safe: bool,
+    connection_usable: bool,
+}
+
+impl AttemptOutcome {
+    fn smtp(result: DeliveryResult, connection_usable: bool) -> Self {
+        Self {
+            result,
+            retry_safe: false,
+            connection_usable,
         }
-    };
+    }
+
+    fn transport(result: DeliveryResult, retry_safe: bool) -> Self {
+        Self {
+            result,
+            retry_safe,
+            connection_usable: false,
+        }
+    }
+}
+
+struct Session {
+    stream: io::BufReader<SmtpStream>,
+}
+
+/// A reusable SMTP session backed by a reconnectable stream connector.
+///
+/// The connector is deliberately limited to producing a `Read + Write`
+/// stream, so a later TLS layer can be introduced without changing the
+/// delivery state machine.
+pub struct SmtpConnection {
+    client_name: String,
+    connector: StreamConnector,
+    session: Option<Session>,
+}
+
+impl SmtpConnection {
+    pub fn new<F>(client_name: impl Into<String>, connector: F) -> Self
+    where
+        F: FnMut() -> io::Result<SmtpStream> + Send + 'static,
+    {
+        Self {
+            client_name: client_name.into(),
+            connector: Box::new(connector),
+            session: None,
+        }
+    }
+
+    /// Deliver a message, reconnecting at most once when explicit attempt
+    /// metadata says no body could have started.
+    pub fn deliver(
+        &mut self,
+        envelope: &Envelope,
+        dkim_signature: &[u8],
+        message: &[u8],
+    ) -> DeliveryResult {
+        for attempt in 0..=1 {
+            let outcome = self.attempt(envelope, dkim_signature, message);
+            if !outcome.connection_usable {
+                self.session = None;
+            }
+            if attempt == 0 && outcome.retry_safe {
+                continue;
+            }
+            return outcome.result;
+        }
+        unreachable!("bounded retry loop always returns")
+    }
+
+    fn attempt(
+        &mut self,
+        envelope: &Envelope,
+        dkim_signature: &[u8],
+        message: &[u8],
+    ) -> AttemptOutcome {
+        if self.session.is_none() {
+            let stream = match (self.connector)() {
+                Ok(stream) => stream,
+                Err(error) => {
+                    return AttemptOutcome::transport(
+                        DeliveryResult::temporary_failure(format!("connect: {error}"), None),
+                        true,
+                    );
+                }
+            };
+            let mut session = Session {
+                stream: io::BufReader::new(stream),
+            };
+            if let Err(outcome) = initialize_session(&mut session, &self.client_name) {
+                return outcome;
+            }
+            self.session = Some(session);
+        }
+
+        run_transaction(
+            self.session.as_mut().expect("session initialized"),
+            envelope,
+            dkim_signature,
+            message,
+        )
+    }
+}
+
+fn write_command(session: &mut Session, bytes: &[u8], context: &str) -> Result<(), AttemptOutcome> {
+    session.stream.get_mut().write_all(bytes).map_err(|error| {
+        AttemptOutcome::transport(
+            DeliveryResult::temporary_failure(format!("{context} write: {error}"), None),
+            true,
+        )
+    })?;
+    session.stream.get_mut().flush().map_err(|error| {
+        AttemptOutcome::transport(
+            DeliveryResult::temporary_failure(format!("{context} flush: {error}"), None),
+            true,
+        )
+    })
+}
+
+fn read_session_reply(session: &mut Session, context: &str) -> Result<SmtpReply, AttemptOutcome> {
+    read_reply(&mut session.stream, DELIVERY_MAX_LINE_LEN).map_err(|error| {
+        AttemptOutcome::transport(
+            DeliveryResult::temporary_failure(format!("{context} read: {error:?}"), None),
+            true,
+        )
+    })
+}
+
+fn initialize_session(session: &mut Session, client_name: &str) -> Result<(), AttemptOutcome> {
+    let greeting = read_session_reply(session, "greeting")?;
     if greeting.code != 220 {
-        return code_rejection("greeting", greeting.code);
+        return Err(AttemptOutcome::smtp(
+            code_rejection("greeting", greeting.code),
+            greeting.code != 221,
+        ));
     }
+    write_command(
+        session,
+        format!("EHLO {client_name}\r\n").as_bytes(),
+        "EHLO",
+    )?;
+    let reply = read_session_reply(session, "EHLO")?;
+    if reply.code != 250 {
+        return Err(AttemptOutcome::smtp(
+            code_rejection("EHLO", reply.code),
+            reply.code != 221,
+        ));
+    }
+    Ok(())
+}
 
-    // 2. EHLO.
-    if let Err(e) = writer.write_all(format!("EHLO {client_name}\r\n").as_bytes()) {
-        return DeliveryResult::temporary_failure(format!("EHLO write: {e}"), None);
+fn run_transaction(
+    session: &mut Session,
+    envelope: &Envelope,
+    dkim_signature: &[u8],
+    message: &[u8],
+) -> AttemptOutcome {
+    if let Err(error) = write_mail_from(session.stream.get_mut(), envelope) {
+        return AttemptOutcome::transport(
+            DeliveryResult::temporary_failure(format!("MAIL write: {error}"), None),
+            true,
+        );
     }
-    let _ = writer.flush();
-    let ehlo_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
-        Ok(r) => r,
-        Err(e) => {
-            return DeliveryResult::temporary_failure(format!("EHLO read: {e:?}"), None);
-        }
-    };
-    if ehlo_reply.code != 250 {
-        return code_rejection("EHLO", ehlo_reply.code);
+    if let Err(outcome) = write_command(session, b"", "MAIL") {
+        return outcome;
     }
-
-    // 3. MAIL FROM.
-    if let Err(e) = write_mail_from(&mut writer, envelope) {
-        return DeliveryResult::temporary_failure(format!("MAIL write: {e}"), None);
-    }
-    let _ = writer.flush();
-    let mail_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
-        Ok(r) => r,
-        Err(e) => {
-            return DeliveryResult::temporary_failure(format!("MAIL read: {e:?}"), None);
-        }
+    let mail_reply = match read_session_reply(session, "MAIL") {
+        Ok(reply) => reply,
+        Err(outcome) => return outcome,
     };
     if mail_reply.code != 250 {
-        return code_rejection("MAIL", mail_reply.code);
+        return AttemptOutcome::smtp(
+            code_rejection("MAIL", mail_reply.code),
+            mail_reply.code != 221,
+        );
     }
 
-    // 4. RCPT TO — send all, then check responses.
-    if let Err(e) = write_rcpt_to_list(&mut writer, envelope) {
-        return DeliveryResult::temporary_failure(format!("RCPT write: {e}"), None);
-    }
-    let _ = writer.flush();
-    let mut first_4xx: Option<u16> = None;
-    let mut first_5xx: Option<u16> = None;
-    for _ in envelope.recipients() {
-        let rcpt_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
-            Ok(r) => r,
-            Err(e) => {
-                return DeliveryResult::temporary_failure(format!("RCPT read: {e:?}"), None);
-            }
+    let mut first_4xx = None;
+    let mut first_5xx = None;
+    let mut first_other = None;
+    let mut usable = true;
+    for recipient in envelope.recipients() {
+        let writer = session.stream.get_mut();
+        if let Err(error) = writer
+            .write_all(b"RCPT TO:<")
+            .and_then(|()| writer.write_all(recipient))
+            .and_then(|()| writer.write_all(b">\r\n"))
+            .and_then(|()| writer.flush())
+        {
+            return AttemptOutcome::transport(
+                DeliveryResult::temporary_failure(format!("RCPT write: {error}"), None),
+                true,
+            );
+        }
+        let reply = match read_session_reply(session, "RCPT") {
+            Ok(reply) => reply,
+            Err(outcome) => return outcome,
         };
-        if (400..500).contains(&rcpt_reply.code) && first_4xx.is_none() {
-            first_4xx = Some(rcpt_reply.code);
-        } else if rcpt_reply.code >= 500 && first_5xx.is_none() {
-            first_5xx = Some(rcpt_reply.code);
+        if reply.code == 221 {
+            return AttemptOutcome::smtp(code_rejection("recipient", reply.code), false);
         }
+        usable &= reply.code != 221;
+        if (400..500).contains(&reply.code) && first_4xx.is_none() {
+            first_4xx = Some(reply.code);
+        } else if reply.code >= 500 && first_5xx.is_none() {
+            first_5xx = Some(reply.code);
+        } else if !(200..300).contains(&reply.code) && first_other.is_none() {
+            first_other = Some(reply.code);
+        }
+    }
+    if first_4xx.is_some() || first_5xx.is_some() || first_other.is_some() {
+        if usable && write_command(session, b"RSET\r\n", "RSET").is_ok() {
+            match read_session_reply(session, "RSET") {
+                Ok(reply) => usable &= reply.code != 221,
+                Err(_) => usable = false,
+            }
+        }
+        let result = if let Some(code) = first_4xx {
+            DeliveryResult::temporary_failure(format!("recipient: {code}"), Some(code))
+        } else if let Some(code) = first_5xx {
+            DeliveryResult::permanent_failure(format!("recipient: {code}"), Some(code))
+        } else {
+            code_rejection("recipient", first_other.expect("a rejection code exists"))
+        };
+        return AttemptOutcome::smtp(result, usable);
     }
 
-    // 5. On any non-2xx RCPT → RSET, no DATA.
-    //    4xx presence wins (temporary) even when 5xx also present.
-    if first_4xx.is_some() || first_5xx.is_some() {
-        let _ = writer.write_all(b"RSET\r\n");
-        let _ = writer.flush();
-        let _ = read_reply(&mut reader, DELIVERY_MAX_LINE_LEN);
-        if let Some(code) = first_4xx {
-            return DeliveryResult::temporary_failure(format!("recipient: {code}"), Some(code));
-        }
-        let code = first_5xx.unwrap();
-        return DeliveryResult::permanent_failure(format!("recipient: {code}"), Some(code));
+    if let Err(outcome) = write_command(session, b"DATA\r\n", "DATA") {
+        return outcome;
     }
-
-    // 6. DATA — require 354.
-    if let Err(e) = writer.write_all(b"DATA\r\n") {
-        return DeliveryResult::temporary_failure(format!("DATA write: {e}"), None);
-    }
-    let _ = writer.flush();
-    let data_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
-        Ok(r) => r,
-        Err(e) => {
-            // Connection closed before 354 → temp, unambiguous.
-            return DeliveryResult::temporary_failure(format!("DATA: {e:?}"), None);
-        }
+    let data_reply = match read_session_reply(session, "DATA") {
+        Ok(reply) => reply,
+        Err(outcome) => return outcome,
     };
     if data_reply.code != 354 {
-        return code_rejection("DATA", data_reply.code);
+        return AttemptOutcome::smtp(
+            code_rejection("DATA", data_reply.code),
+            data_reply.code != 221,
+        );
     }
-    // At this point the server sent 354; we are about to write the body.
-    // Phase starts at BodyStarted because that is the first value read
-    // by connection_lost().
-    let mut phase = TransactionPhase::BodyStarted;
 
-    // 7. Write DKIM-Signature header + dot-stuffed message.
+    let writer = session.stream.get_mut();
     if writer.write_all(b"DKIM-Signature: ").is_err()
         || writer.write_all(dkim_signature).is_err()
         || writer.write_all(b"\r\n").is_err()
+        || write_data(writer, message).is_err()
+        || writer.flush().is_err()
     {
-        return connection_lost(phase);
+        return AttemptOutcome::transport(connection_lost(TransactionPhase::BodyStarted), false);
     }
-    if write_data(&mut writer, message).is_err() {
-        return connection_lost(phase);
-    }
-    let _ = writer.flush();
-    phase = TransactionPhase::FinalDotSent;
-
-    // 8. Read final response — Delivered only after 2xx.
-    let final_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
-        Ok(r) => r,
+    let final_reply = match read_reply(&mut session.stream, DELIVERY_MAX_LINE_LEN) {
+        Ok(reply) => reply,
         Err(_) => {
-            // After final dot, connection loss is ambiguous.
-            return connection_lost(phase);
+            return AttemptOutcome::transport(
+                connection_lost(TransactionPhase::FinalDotSent),
+                false,
+            );
         }
     };
-    if (200..300).contains(&final_reply.code) {
+    let usable = final_reply.code != 221;
+    let result = if (200..300).contains(&final_reply.code) {
         DeliveryResult::delivered(String::new(), Some(final_reply.code))
     } else {
-        // Final 4xx → temp unambiguous; final 5xx → permanent.
         code_rejection("final", final_reply.code)
-    }
+    };
+    AttemptOutcome::smtp(result, usable)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
