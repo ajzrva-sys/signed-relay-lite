@@ -21,6 +21,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "submission_stream"
+path = "fuzz_targets/submission_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "message"
 path = "fuzz_targets/message.rs"
 test = false
