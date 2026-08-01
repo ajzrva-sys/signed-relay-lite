@@ -1,0 +1,2 @@
+# Use thin LTO and fewer codegen-units for release builds outside of Cargo.toml
+# (kept here so CI and local builds share the same defaults).
