@@ -1,4 +1,4 @@
-//! Strict bounded SRL1 request/response binary codecs.
+//! Strict bounded SRL1 and SRL2 submission binary codecs.
 //!
 //! Wire format is independent of sockets — reads and writes go through
 //! `std::io::Read` and `std::io::Write`, making the codecs testable
@@ -32,6 +32,14 @@ use crate::relay::{DeliveryResult, DeliveryStatus, Envelope, EnvelopeError};
 
 /// Protocol magic bytes.
 const MAGIC: &[u8; 4] = b"SRL1";
+
+/// SRL2 protocol magic bytes.
+const SRL2_MAGIC: &[u8; 4] = b"SRL2";
+
+/// Wire kind for a server reply that authorizes message streaming.
+pub const READY_KIND: u8 = 1;
+/// Wire kind for a final delivery result.
+pub const FINAL_KIND: u8 = 2;
 
 /// Currently supported request flags value (none set).
 const REQUEST_FLAGS_V0: u32 = 0x0000_0000;
@@ -105,14 +113,18 @@ impl SubmissionLimits {
 /// Errors produced during submission codec operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmissionError {
-    /// Wire magic is not `SRL1`.
+    /// Wire magic does not match the codec's expected protocol.
     InvalidMagic,
+    /// A recognized older protocol version is not supported by this codec.
+    UnsupportedVersion(u8),
     /// Request flags contain unknown bits.
     UnknownRequestFlags(u32),
     /// Response flags contain unknown bits.
     UnknownResponseFlags(u8),
     /// Response status byte is not a recognized variant.
     InvalidResponseStatus(u8),
+    /// Server reply kind is not READY or FINAL.
+    UnknownServerReplyKind(u8),
     /// Declared recipient count exceeds the configured limit.
     TooManyRecipients { count: usize, limit: usize },
     /// An address field exceeds the configured limit.
@@ -130,6 +142,29 @@ pub enum SubmissionError {
     Envelope(EnvelopeError),
     /// The global memory budget cannot accommodate the declared message size.
     BudgetExhausted { requested: usize, capacity: usize },
+}
+
+// ── SRL2 frames ──────────────────────────────────────────────────────
+
+/// The validated envelope sent before the server authorizes message input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvelopePreamble {
+    pub envelope: Envelope,
+}
+
+/// Daemon-authoritative limits sent before message streaming begins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Ready {
+    pub max_message_bytes: u64,
+    pub max_chunk_bytes: u32,
+    pub max_diagnostic_bytes: u32,
+}
+
+/// A server response before or after the streamed message body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServerReply {
+    Ready(Ready),
+    Final(DeliveryResult),
 }
 
 impl From<io::Error> for SubmissionError {
@@ -254,6 +289,178 @@ fn truncate_to_utf8_boundary(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+fn read_srl2_magic<R: Read>(r: &mut R) -> Result<(), SubmissionError> {
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)?;
+    if magic == *SRL2_MAGIC {
+        return Ok(());
+    }
+    if magic == *MAGIC {
+        return Err(SubmissionError::UnsupportedVersion(1));
+    }
+    Err(SubmissionError::InvalidMagic)
+}
+
+fn read_final_payload<R: Read>(r: &mut R) -> Result<DeliveryResult, SubmissionError> {
+    let mut status_buf = [0u8; 1];
+    r.read_exact(&mut status_buf)?;
+    let status = match status_buf[0] {
+        STATUS_DELIVERED => DeliveryStatus::Delivered,
+        STATUS_TEMPORARY => DeliveryStatus::TemporaryFailure,
+        STATUS_PERMANENT => DeliveryStatus::PermanentFailure,
+        STATUS_PROTOCOL => DeliveryStatus::ProtocolRejection,
+        other => return Err(SubmissionError::InvalidResponseStatus(other)),
+    };
+
+    let mut flags_buf = [0u8; 1];
+    r.read_exact(&mut flags_buf)?;
+    let flags = flags_buf[0];
+    if flags & !RESPONSE_FLAGS_KNOWN != 0 {
+        return Err(SubmissionError::UnknownResponseFlags(flags));
+    }
+
+    let smtp_raw = read_u16(r)?;
+    let diag_len = read_u32_limited(r, MAX_DIAGNOSTIC_BYTES, |len, limit| {
+        SubmissionError::DiagnosticTooLong { len, limit }
+    })?;
+    let diagnostic = String::from_utf8(read_bytes(r, diag_len)?)
+        .map_err(|_| SubmissionError::InvalidDiagnosticUtf8)?;
+
+    Ok(DeliveryResult {
+        status,
+        ambiguous: flags & 0x01 != 0,
+        smtp_code: (smtp_raw != 0).then_some(smtp_raw),
+        diagnostic,
+    })
+}
+
+fn write_final_payload<W: Write>(w: &mut W, result: &DeliveryResult) -> Result<(), io::Error> {
+    let status = match result.status {
+        DeliveryStatus::Delivered => STATUS_DELIVERED,
+        DeliveryStatus::TemporaryFailure => STATUS_TEMPORARY,
+        DeliveryStatus::PermanentFailure => STATUS_PERMANENT,
+        DeliveryStatus::ProtocolRejection => STATUS_PROTOCOL,
+    };
+    w.write_all(&[status, u8::from(result.ambiguous)])?;
+    write_u16(w, result.smtp_code.unwrap_or(0))?;
+    let diagnostic = truncate_to_utf8_boundary(&result.diagnostic, MAX_DIAGNOSTIC_BYTES);
+    write_u32(w, diagnostic.len() as u32)?;
+    w.write_all(diagnostic.as_bytes())
+}
+
+/// Encode an SRL2 envelope preamble.
+pub fn write_envelope_preamble<W: Write>(
+    w: &mut W,
+    preamble: &EnvelopePreamble,
+) -> Result<(), io::Error> {
+    w.write_all(SRL2_MAGIC)?;
+    write_u32(w, REQUEST_FLAGS_V0)?;
+    let sender = preamble.envelope.sender();
+    write_u32(
+        w,
+        u32::try_from(sender.len()).expect("validated sender exceeds u32"),
+    )?;
+    w.write_all(sender)?;
+    let recipients = preamble.envelope.recipients();
+    write_u32(
+        w,
+        u32::try_from(recipients.len()).expect("validated recipient count exceeds u32"),
+    )?;
+    for recipient in recipients {
+        write_u32(
+            w,
+            u32::try_from(recipient.len()).expect("validated recipient exceeds u32"),
+        )?;
+        w.write_all(recipient)?;
+    }
+    Ok(())
+}
+
+/// Decode and validate an SRL2 envelope preamble.
+pub fn read_envelope_preamble<R: Read>(r: &mut R) -> Result<EnvelopePreamble, SubmissionError> {
+    read_srl2_magic(r)?;
+    let flags = read_u32(r)?;
+    if flags & !REQUEST_FLAGS_KNOWN != 0 {
+        return Err(SubmissionError::UnknownRequestFlags(flags));
+    }
+
+    let sender_len = read_u32_limited(r, MAX_ADDRESS_BYTES, |len, limit| {
+        SubmissionError::AddressTooLong { len, limit }
+    })?;
+    let sender = read_bytes(r, sender_len)?;
+    let count_raw = read_u32(r)?;
+    let count = usize::try_from(count_raw).map_err(|_| SubmissionError::TooManyRecipients {
+        count: count_raw as usize,
+        limit: MAX_RECIPIENTS,
+    })?;
+    if count > MAX_RECIPIENTS {
+        return Err(SubmissionError::TooManyRecipients {
+            count,
+            limit: MAX_RECIPIENTS,
+        });
+    }
+    let mut recipients = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = read_u32_limited(r, MAX_ADDRESS_BYTES, |len, limit| {
+            SubmissionError::AddressTooLong { len, limit }
+        })?;
+        recipients.push(read_bytes(r, len)?);
+    }
+    Ok(EnvelopePreamble {
+        envelope: Envelope::new(&sender, recipients)?,
+    })
+}
+
+/// Encode an SRL2 READY or FINAL server reply.
+pub fn write_server_reply<W: Write>(w: &mut W, reply: &ServerReply) -> Result<(), io::Error> {
+    w.write_all(SRL2_MAGIC)?;
+    match reply {
+        ServerReply::Ready(ready) => {
+            w.write_all(&[READY_KIND])?;
+            write_u64(w, ready.max_message_bytes)?;
+            write_u32(w, ready.max_chunk_bytes)?;
+            write_u32(w, ready.max_diagnostic_bytes)
+        }
+        ServerReply::Final(result) => {
+            w.write_all(&[FINAL_KIND])?;
+            write_final_payload(w, result)
+        }
+    }
+}
+
+/// Decode an SRL2 READY or FINAL server reply.
+pub fn read_server_reply<R: Read>(r: &mut R) -> Result<ServerReply, SubmissionError> {
+    read_srl2_magic(r)?;
+    let mut kind = [0u8; 1];
+    r.read_exact(&mut kind)?;
+    match kind[0] {
+        READY_KIND => Ok(ServerReply::Ready(Ready {
+            max_message_bytes: {
+                let mut bytes = [0u8; 8];
+                r.read_exact(&mut bytes)?;
+                u64::from_be_bytes(bytes)
+            },
+            max_chunk_bytes: read_u32(r)?,
+            max_diagnostic_bytes: read_u32(r)?,
+        })),
+        FINAL_KIND => Ok(ServerReply::Final(read_final_payload(r)?)),
+        other => Err(SubmissionError::UnknownServerReplyKind(other)),
+    }
+}
+
+/// Encode a complete SRL2 FINAL result frame.
+pub fn write_final_result<W: Write>(w: &mut W, result: &DeliveryResult) -> Result<(), io::Error> {
+    write_server_reply(w, &ServerReply::Final(result.clone()))
+}
+
+/// Decode a complete SRL2 FINAL result frame.
+pub fn read_final_result<R: Read>(r: &mut R) -> Result<DeliveryResult, SubmissionError> {
+    match read_server_reply(r)? {
+        ServerReply::Final(result) => Ok(result),
+        ServerReply::Ready(_) => Err(SubmissionError::UnknownServerReplyKind(READY_KIND)),
+    }
 }
 
 // ── Request codec ─────────────────────────────────────────────────────
@@ -1566,5 +1773,242 @@ mod tests {
 
         let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
         assert_eq!(decoded.diagnostic, "ok");
+    }
+
+    // ── SRL2 codecs ──────────────────────────────────────────────────
+
+    #[test]
+    fn srl2_envelope_preamble_has_exact_golden_bytes() {
+        let preamble = EnvelopePreamble {
+            envelope: Envelope::new(b"a@b", vec![b"c@d".to_vec()]).unwrap(),
+        };
+        let expected = vec![
+            b'S', b'R', b'L', b'2', 0, 0, 0, 0, 0, 0, 0, 3, b'a', b'@', b'b', 0, 0, 0, 1, 0, 0, 0,
+            3, b'c', b'@', b'd',
+        ];
+        let mut actual = Vec::new();
+        write_envelope_preamble(&mut actual, &preamble).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            read_envelope_preamble(&mut Cursor::new(expected)).unwrap(),
+            preamble
+        );
+    }
+
+    #[test]
+    fn srl2_ready_reply_has_exact_golden_bytes() {
+        let reply = ServerReply::Ready(Ready {
+            max_message_bytes: 1024,
+            max_chunk_bytes: 65_536,
+            max_diagnostic_bytes: 4096,
+        });
+        let expected = vec![
+            b'S', b'R', b'L', b'2', 1, 0, 0, 0, 0, 0, 0, 4, 0, 0, 1, 0, 0, 0, 0, 16, 0,
+        ];
+        let mut actual = Vec::new();
+        write_server_reply(&mut actual, &reply).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            read_server_reply(&mut Cursor::new(expected)).unwrap(),
+            reply
+        );
+    }
+
+    #[test]
+    fn srl2_early_final_reply_has_exact_golden_bytes() {
+        let reply = ServerReply::Final(DeliveryResult::protocol_rejection("bad", None));
+        let expected = vec![
+            b'S', b'R', b'L', b'2', 2, 3, 0, 0, 0, 0, 0, 0, 3, b'b', b'a', b'd',
+        ];
+        let mut actual = Vec::new();
+        write_server_reply(&mut actual, &reply).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            read_server_reply(&mut Cursor::new(expected)).unwrap(),
+            reply
+        );
+    }
+
+    #[test]
+    fn srl2_final_delivery_result_has_exact_golden_bytes() {
+        let result = DeliveryResult::delivered("ok", Some(250));
+        let expected = vec![
+            b'S', b'R', b'L', b'2', 2, 0, 0, 0, 250, 0, 0, 0, 2, b'o', b'k',
+        ];
+        let mut actual = Vec::new();
+        write_final_result(&mut actual, &result).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            read_final_result(&mut Cursor::new(expected)).unwrap(),
+            result
+        );
+    }
+
+    fn assert_truncated_envelope(frame: &[u8]) {
+        assert_eq!(
+            read_envelope_preamble(&mut Cursor::new(frame)).unwrap_err(),
+            SubmissionError::Io(io::ErrorKind::UnexpectedEof)
+        );
+    }
+
+    fn assert_truncated_reply(frame: &[u8]) {
+        assert_eq!(
+            read_server_reply(&mut Cursor::new(frame)).unwrap_err(),
+            SubmissionError::Io(io::ErrorKind::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn srl2_rejects_wrong_magic() {
+        assert_eq!(
+            read_envelope_preamble(&mut Cursor::new(b"NOPE")).unwrap_err(),
+            SubmissionError::InvalidMagic
+        );
+    }
+
+    #[test]
+    fn srl2_rejects_srl1_as_unsupported() {
+        assert_eq!(
+            read_envelope_preamble(&mut Cursor::new(b"SRL1")).unwrap_err(),
+            SubmissionError::UnsupportedVersion(1)
+        );
+    }
+
+    #[test]
+    fn srl2_rejects_unknown_reply_kind() {
+        let frame = [b'S', b'R', b'L', b'2', 9];
+        assert_eq!(
+            read_server_reply(&mut Cursor::new(frame)).unwrap_err(),
+            SubmissionError::UnknownServerReplyKind(9)
+        );
+    }
+
+    #[test]
+    fn srl2_rejects_unknown_envelope_flags() {
+        let frame = [b'S', b'R', b'L', b'2', 0, 0, 0, 1];
+        assert_eq!(
+            read_envelope_preamble(&mut Cursor::new(frame)).unwrap_err(),
+            SubmissionError::UnknownRequestFlags(1)
+        );
+    }
+
+    #[test]
+    fn srl2_rejects_unknown_final_flags() {
+        let frame = [b'S', b'R', b'L', b'2', 2, 0, 2];
+        assert_eq!(
+            read_server_reply(&mut Cursor::new(frame)).unwrap_err(),
+            SubmissionError::UnknownResponseFlags(2)
+        );
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_envelope_magic() {
+        assert_truncated_envelope(b"SRL");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_envelope_flags() {
+        assert_truncated_envelope(b"SRL2\0\0\0");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_sender_length() {
+        assert_truncated_envelope(b"SRL2\0\0\0\0\0\0\0");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_sender_data() {
+        assert_truncated_envelope(b"SRL2\0\0\0\0\0\0\0\x03a");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_recipient_count() {
+        assert_truncated_envelope(b"SRL2\0\0\0\0\0\0\0\0\0\0");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_recipient_length() {
+        assert_truncated_envelope(b"SRL2\0\0\0\0\0\0\0\0\0\0\0\x01\0\0\0");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_recipient_data() {
+        assert_truncated_envelope(b"SRL2\0\0\0\0\0\0\0\0\0\0\0\x01\0\0\0\x03a");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_reply_magic() {
+        assert_truncated_reply(b"SRL");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_reply_kind() {
+        assert_truncated_reply(b"SRL2");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_ready_message_limit() {
+        assert_truncated_reply(b"SRL2\x01\0\0\0\0\0\0\0");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_ready_chunk_limit() {
+        assert_truncated_reply(b"SRL2\x01\0\0\0\0\0\0\0\x01\0\0\0");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_ready_diagnostic_limit() {
+        assert_truncated_reply(b"SRL2\x01\0\0\0\0\0\0\0\x01\0\0\0\x01\0\0\0");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_final_status() {
+        assert_truncated_reply(b"SRL2\x02");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_final_flags() {
+        assert_truncated_reply(b"SRL2\x02\0");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_final_smtp_code() {
+        assert_truncated_reply(b"SRL2\x02\0\0\0");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_final_diagnostic_length() {
+        assert_truncated_reply(b"SRL2\x02\0\0\0\0\0\0\0");
+    }
+
+    #[test]
+    fn srl2_rejects_truncated_final_diagnostic_data() {
+        assert_truncated_reply(b"SRL2\x02\0\0\0\0\0\0\0\x03a");
+    }
+
+    #[test]
+    fn srl2_rejects_recipient_overflow_before_reading_recipients() {
+        let mut frame = b"SRL2\0\0\0\0\0\0\0\0".to_vec();
+        frame.extend_from_slice(&((MAX_RECIPIENTS + 1) as u32).to_be_bytes());
+        assert_eq!(
+            read_envelope_preamble(&mut Cursor::new(frame)).unwrap_err(),
+            SubmissionError::TooManyRecipients {
+                count: MAX_RECIPIENTS + 1,
+                limit: MAX_RECIPIENTS,
+            }
+        );
+    }
+
+    #[test]
+    fn srl2_rejects_address_overflow_before_allocation() {
+        let mut frame = b"SRL2\0\0\0\0".to_vec();
+        frame.extend_from_slice(&((MAX_ADDRESS_BYTES + 1) as u32).to_be_bytes());
+        assert_eq!(
+            read_envelope_preamble(&mut Cursor::new(frame)).unwrap_err(),
+            SubmissionError::AddressTooLong {
+                len: MAX_ADDRESS_BYTES + 1,
+                limit: MAX_ADDRESS_BYTES,
+            }
+        );
     }
 }
