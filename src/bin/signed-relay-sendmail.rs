@@ -20,7 +20,8 @@ const EX_OK: i32 = 0;
 const EX_USAGE: i32 = 64;
 const EX_UNAVAILABLE: i32 = 69;
 const EX_TEMPFAIL: i32 = 75;
-const MAX_MESSAGE_BYTES: usize = 26_214_400;
+#[cfg(test)]
+const LEGACY_CLIENT_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -133,8 +134,8 @@ enum ClientError {
     Response(SubmissionError),
 }
 
-fn read_message(input: &mut impl Read) -> Result<Vec<u8>, InputError> {
-    let mut normalizer = WireNormalizer::new(MAX_MESSAGE_BYTES);
+fn read_message(input: &mut impl Read, max_message_bytes: usize) -> Result<Vec<u8>, InputError> {
+    let mut normalizer = WireNormalizer::new(max_message_bytes);
     let mut chunk = [0_u8; 8192];
     loop {
         let read = input.read(&mut chunk).map_err(|_| InputError::Io)?;
@@ -154,18 +155,18 @@ fn submit_message<R: Read, S: Read + Write>(
     envelope: &Envelope,
     shutdown_write: impl FnOnce(&mut S) -> io::Result<()>,
 ) -> Result<DeliveryResult, ClientError> {
-    let message = read_message(input).map_err(ClientError::Input)?;
+    let legacy_message_bytes = 25 * 1024 * 1024;
+    let message = read_message(input, legacy_message_bytes).map_err(ClientError::Input)?;
     write_request(stream, envelope, &message).map_err(|_| ClientError::Write)?;
     stream.flush().map_err(|_| ClientError::Write)?;
     shutdown_write(stream).map_err(|_| ClientError::Write)?;
 
-    let limits = SubmissionLimits {
-        max_recipients: 100,
-        max_address_bytes: 254,
-        max_message_bytes: MAX_MESSAGE_BYTES as u64,
-        max_diagnostic_bytes: 4096,
-    };
+    let limits = submission_limits(legacy_message_bytes as u64);
     read_response(stream, &limits).map_err(ClientError::Response)
+}
+
+fn submission_limits(max_message_bytes: u64) -> SubmissionLimits {
+    SubmissionLimits::production(max_message_bytes)
 }
 
 fn write_request(stream: &mut impl Write, envelope: &Envelope, message: &[u8]) -> io::Result<()> {
@@ -193,6 +194,15 @@ fn local_error(code: i32, context: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_submission_limits_accept_daemon_message_limit() {
+        let limits = submission_limits(123_456);
+        assert_eq!(limits.max_recipients, 100);
+        assert_eq!(limits.max_address_bytes, 254);
+        assert_eq!(limits.max_message_bytes, 123_456);
+        assert_eq!(limits.max_diagnostic_bytes, 4096);
+    }
     use std::cell::Cell;
     use std::io::Cursor;
     use std::rc::Rc;
@@ -293,7 +303,8 @@ mod tests {
     #[test]
     fn client_accepts_a_stream_larger_than_the_removed_25_mib_constant_when_server_allows_it() {
         let reads = Rc::new(Cell::new(0));
-        let mut input = CountingGeneratedReader::new(MAX_MESSAGE_BYTES + 1, Rc::clone(&reads));
+        let mut input =
+            CountingGeneratedReader::new(LEGACY_CLIENT_MESSAGE_BYTES + 1, Rc::clone(&reads));
         let mut peer = FakeDuplex::delivering(reads);
         let result = submit_message(&mut input, &mut peer, &envelope(), |_| Ok(()));
         assert!(

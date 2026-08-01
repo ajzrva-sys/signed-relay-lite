@@ -51,8 +51,24 @@ const STATUS_PERMANENT: u8 = 2;
 /// Wire status byte for `DeliveryStatus::ProtocolRejection`.
 const STATUS_PROTOCOL: u8 = 3;
 
-/// Default maximum message size from the approved plan (25 MiB).
-const DEFAULT_MAX_MESSAGE_BYTES: u64 = 26_214_400;
+/// Maximum number of recipients in one envelope.
+pub const MAX_RECIPIENTS: usize = 100;
+/// Maximum bytes in one envelope address.
+pub const MAX_ADDRESS_BYTES: usize = 254;
+/// Maximum bytes in a delivery diagnostic.
+pub const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+/// Maximum bytes in one SRL2 message chunk.
+#[allow(dead_code)] // Used when the SRL2 stream codec lands.
+pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
+
+impl Envelope {
+    pub(crate) const MAX_RECIPIENTS: usize = MAX_RECIPIENTS;
+    pub(crate) const MAX_ADDRESS_BYTES: usize = MAX_ADDRESS_BYTES;
+}
+
+impl DeliveryResult {
+    pub(crate) const MAX_DIAGNOSTIC_BYTES: usize = MAX_DIAGNOSTIC_BYTES;
+}
 
 // ── Limits ────────────────────────────────────────────────────────────
 
@@ -73,13 +89,13 @@ pub struct SubmissionLimits {
 }
 
 impl SubmissionLimits {
-    /// Generous defaults for testing / development.
-    pub fn permissive() -> Self {
+    /// Fixed protocol ceilings paired with the daemon's active message limit.
+    pub fn production(max_message_bytes: u64) -> Self {
         Self {
-            max_recipients: 100,
-            max_address_bytes: 254,
-            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
-            max_diagnostic_bytes: 4096,
+            max_recipients: MAX_RECIPIENTS,
+            max_address_bytes: MAX_ADDRESS_BYTES,
+            max_message_bytes,
+            max_diagnostic_bytes: MAX_DIAGNOSTIC_BYTES,
         }
     }
 }
@@ -418,7 +434,8 @@ pub fn read_response<R: Read>(
 /// The diagnostic is defensively truncated to `max_diagnostic_bytes` at
 /// a UTF-8 boundary before encoding.
 ///
-/// `max_diagnostic_bytes` is clamped to `min(4096, u32::MAX)` to prevent
+/// `max_diagnostic_bytes` is clamped to the protocol diagnostic ceiling and
+/// `u32::MAX` to prevent
 /// panic when the configured limit exceeds `u32::MAX`. The truncation
 /// always lands on a UTF-8 character boundary.
 pub fn write_response<W: Write>(
@@ -426,8 +443,9 @@ pub fn write_response<W: Write>(
     result: &DeliveryResult,
     max_diagnostic_bytes: usize,
 ) -> Result<(), io::Error> {
-    // Clamp max_diagnostic_bytes to u32::MAX, then to 4096 per plan.
-    let effective_max = max_diagnostic_bytes.min(u32::MAX as usize).min(4096);
+    let effective_max = max_diagnostic_bytes
+        .min(u32::MAX as usize)
+        .min(MAX_DIAGNOSTIC_BYTES);
 
     // Magic
     w.write_all(MAGIC)?;
@@ -460,6 +478,57 @@ pub fn write_response<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn envelope_and_decoder_share_recipient_and_address_limits() {
+        let limits = SubmissionLimits {
+            max_recipients: MAX_RECIPIENTS,
+            max_address_bytes: MAX_ADDRESS_BYTES,
+            max_message_bytes: 2,
+            max_diagnostic_bytes: MAX_DIAGNOSTIC_BYTES,
+        };
+
+        let recipients = vec![vec![b'a'; MAX_ADDRESS_BYTES]; MAX_RECIPIENTS];
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(MAGIC);
+        encoded.extend_from_slice(&0_u32.to_be_bytes());
+        encoded.extend_from_slice(&0_u32.to_be_bytes());
+        encoded.extend_from_slice(&(recipients.len() as u32).to_be_bytes());
+        for recipient in &recipients {
+            encoded.extend_from_slice(&(recipient.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(recipient);
+        }
+        encoded.extend_from_slice(&2_u64.to_be_bytes());
+        encoded.extend_from_slice(b"\r\n");
+        let budget = MemoryBudget::new(2);
+        read_request(&mut Cursor::new(encoded), &limits, &budget).unwrap();
+
+        assert_eq!(
+            Envelope::new(b"", vec![vec![b'a'; MAX_ADDRESS_BYTES + 1]]).unwrap_err(),
+            EnvelopeError::AddressTooLong(MAX_ADDRESS_BYTES + 1)
+        );
+        assert_eq!(
+            Envelope::new(b"", vec![b"a@example.test".to_vec(); MAX_RECIPIENTS + 1]).unwrap_err(),
+            EnvelopeError::TooManyRecipients(MAX_RECIPIENTS + 1)
+        );
+    }
+
+    #[test]
+    fn delivery_result_and_decoder_share_diagnostic_limit() {
+        let limits = SubmissionLimits {
+            max_recipients: MAX_RECIPIENTS,
+            max_address_bytes: MAX_ADDRESS_BYTES,
+            max_message_bytes: 1,
+            max_diagnostic_bytes: MAX_DIAGNOSTIC_BYTES,
+        };
+        let result = DeliveryResult::temporary_failure("x".repeat(MAX_DIAGNOSTIC_BYTES + 1), None);
+        assert_eq!(result.diagnostic.len(), MAX_DIAGNOSTIC_BYTES);
+
+        let mut encoded = Vec::new();
+        write_response(&mut encoded, &result, usize::MAX).unwrap();
+        let decoded = read_response(&mut Cursor::new(encoded), &limits).unwrap();
+        assert_eq!(decoded.diagnostic.len(), MAX_DIAGNOSTIC_BYTES);
+    }
     use std::io::Cursor;
 
     // ── helpers ───────────────────────────────────────────────────────
@@ -511,7 +580,7 @@ mod tests {
     }
 
     fn permissive_limits() -> SubmissionLimits {
-        SubmissionLimits::permissive()
+        SubmissionLimits::production(26_214_400)
     }
 
     fn permissive_budget() -> MemoryBudget {
@@ -1497,13 +1566,5 @@ mod tests {
 
         let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
         assert_eq!(decoded.diagnostic, "ok");
-    }
-
-    // ── default max_message_bytes ─────────────────────────────────────
-
-    #[test]
-    fn default_max_message_bytes_is_26214400() {
-        let limits = SubmissionLimits::permissive();
-        assert_eq!(limits.max_message_bytes, 26_214_400);
     }
 }

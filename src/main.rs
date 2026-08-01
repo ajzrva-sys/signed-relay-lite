@@ -96,16 +96,8 @@ fn run_daemon(path: PathBuf) -> Result<(), String> {
         .map_err(|error| format!("cannot initialize relay workers: {error}"))?,
     );
 
-    let submission_limits = SubmissionLimits {
-        max_recipients: 100,
-        max_address_bytes: 254,
-        max_message_bytes: config.max_message_bytes as u64,
-        max_diagnostic_bytes: 4096,
-    };
-    let message_limits = MessageLimits {
-        max_headers: 1000,
-        max_header_bytes: config.max_message_bytes.min(1024 * 1024),
-    };
+    let submission_limits = SubmissionLimits::production(config.max_message_bytes as u64);
+    let message_limits = MessageLimits::production(config.max_message_bytes);
     install_signal_handlers()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let server = SubmissionServer::bind(

@@ -54,13 +54,17 @@ fn signing() -> SigningConfig {
     }
 }
 
+fn submission_limits() -> SubmissionLimits {
+    SubmissionLimits::production(26_214_400)
+}
+
 fn bind(path: &Path, mode: u32, shutdown: Arc<AtomicBool>) -> io::Result<SubmissionServer> {
     SubmissionServer::bind(
         path,
         mode,
         Duration::from_millis(150),
         2,
-        SubmissionLimits::permissive(),
+        submission_limits(),
         MessageLimits::testing(),
         MemoryBudget::new(1024 * 1024),
         signing(),
@@ -302,7 +306,7 @@ fn replacement_at_path_is_preserved_on_shutdown() {
 #[test]
 fn valid_request_waits_for_worker_and_returns_exact_final_result_with_signed_original() {
     let path = TestPath::new();
-    let limits = SubmissionLimits::permissive();
+    let limits = submission_limits();
     let (relay, captured, release, peer) = gated_relay(b"250 final exact\r\n");
     let Some((shutdown, server)) = start_server(
         &path.0,
@@ -340,7 +344,7 @@ fn valid_request_waits_for_worker_and_returns_exact_final_result_with_signed_ori
 #[test]
 fn slow_truncated_client_times_out_with_bounded_non_delivered_outcome() {
     let path = TestPath::new();
-    let limits = SubmissionLimits::permissive();
+    let limits = submission_limits();
     let Some((shutdown, server)) = start_server(
         &path.0,
         Duration::from_millis(80),
@@ -367,7 +371,7 @@ fn slow_truncated_client_times_out_with_bounded_non_delivered_outcome() {
 #[test]
 fn budget_is_held_through_worker_completion_and_released_afterward() {
     let path = TestPath::new();
-    let limits = SubmissionLimits::permissive();
+    let limits = submission_limits();
     let first = b"From: a@example.com\r\n\r\n1234567890\r\n";
     let second = b"From: c@example.com\r\n\r\nabcdefghij\r\n";
     let capacity = first.len() + second.len() - 1;
@@ -418,7 +422,7 @@ fn budget_is_held_through_worker_completion_and_released_afterward() {
 #[test]
 fn max_active_handlers_bounds_gated_clients() {
     let path = TestPath::new();
-    let limits = SubmissionLimits::permissive();
+    let limits = submission_limits();
     let (relay, captured, release, peer) = gated_relay(b"250 done\r\n");
     let Some((shutdown, server)) = start_server(
         &path.0,
@@ -463,7 +467,7 @@ fn max_active_handlers_bounds_gated_clients() {
 #[test]
 fn parse_and_frame_failures_are_bounded_and_never_delivered() {
     let path = TestPath::new();
-    let mut limits = SubmissionLimits::permissive();
+    let mut limits = submission_limits();
     limits.max_diagnostic_bytes = 32;
     let Some((shutdown, server)) = start_server(
         &path.0,
@@ -492,7 +496,7 @@ fn parse_and_frame_failures_are_bounded_and_never_delivered() {
 #[test]
 fn socket_write_timeout_is_bounded_when_client_does_not_read() {
     let path = TestPath::new();
-    let mut limits = SubmissionLimits::permissive();
+    let mut limits = submission_limits();
     limits.max_diagnostic_bytes = 4096;
     let Some((shutdown, server)) = start_server(
         &path.0,
@@ -530,7 +534,7 @@ fn socket_write_timeout_is_bounded_when_client_does_not_read() {
 #[test]
 fn shutdown_waits_for_inflight_handler_and_preserves_replacement_path() {
     let path = TestPath::new();
-    let limits = SubmissionLimits::permissive();
+    let limits = submission_limits();
     let (relay, captured, release, peer) = gated_relay(b"250 done\r\n");
     let Some((shutdown, server)) = start_server(
         &path.0,
@@ -575,7 +579,7 @@ fn rejects_zero_timeout_zero_mode_and_special_mode_bits() {
             mode,
             timeout,
             1,
-            SubmissionLimits::permissive(),
+            submission_limits(),
             MessageLimits::testing(),
             MemoryBudget::new(1),
             signing(),

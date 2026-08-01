@@ -3,6 +3,9 @@
 use crate::dkim::BodyCanonicalizer;
 use std::ops::Range;
 
+const PRODUCTION_MAX_HEADERS: usize = 1000;
+const PRODUCTION_MAX_HEADER_BYTES: usize = 1024 * 1024;
+
 /// Errors produced during message parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
@@ -37,6 +40,14 @@ pub struct Limits {
 }
 
 impl Limits {
+    /// Production parser limits derived from the active message-size policy.
+    pub fn production(max_message_bytes: usize) -> Self {
+        Self {
+            max_headers: PRODUCTION_MAX_HEADERS,
+            max_header_bytes: max_message_bytes.min(PRODUCTION_MAX_HEADER_BYTES),
+        }
+    }
+
     /// Generous defaults for testing.
     pub fn testing() -> Self {
         Self {
@@ -237,6 +248,17 @@ fn is_valid_header_name_byte(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_limits_derive_header_cap_from_message_limit() {
+        let below_cap = Limits::production(123_456);
+        assert_eq!(below_cap.max_headers, PRODUCTION_MAX_HEADERS);
+        assert_eq!(below_cap.max_header_bytes, 123_456);
+
+        let above_cap = Limits::production(PRODUCTION_MAX_HEADER_BYTES + 1);
+        assert_eq!(above_cap.max_headers, PRODUCTION_MAX_HEADERS);
+        assert_eq!(above_cap.max_header_bytes, PRODUCTION_MAX_HEADER_BYTES);
+    }
 
     #[test]
     fn parses_folded_header_as_one_field() {

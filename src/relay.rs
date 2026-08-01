@@ -24,9 +24,6 @@ pub enum DeliveryStatus {
     ProtocolRejection,
 }
 
-/// Maximum diagnostic payload in bytes (UTF-8).
-const MAX_DIAGNOSTIC_BYTES: usize = 4096;
-
 /// Outcome of a single delivery attempt.
 ///
 /// `diagnostic` is bounded to 4096 bytes, truncated
@@ -266,7 +263,7 @@ impl DeliveryResult {
             status: DeliveryStatus::Delivered,
             ambiguous: false,
             smtp_code,
-            diagnostic: truncate_to_bytes(&diagnostic.into(), MAX_DIAGNOSTIC_BYTES),
+            diagnostic: truncate_to_bytes(&diagnostic.into(), Self::MAX_DIAGNOSTIC_BYTES),
         }
     }
 
@@ -276,7 +273,7 @@ impl DeliveryResult {
             status: DeliveryStatus::TemporaryFailure,
             ambiguous: false,
             smtp_code,
-            diagnostic: truncate_to_bytes(&diagnostic.into(), MAX_DIAGNOSTIC_BYTES),
+            diagnostic: truncate_to_bytes(&diagnostic.into(), Self::MAX_DIAGNOSTIC_BYTES),
         }
     }
 
@@ -286,7 +283,7 @@ impl DeliveryResult {
             status: DeliveryStatus::PermanentFailure,
             ambiguous: false,
             smtp_code,
-            diagnostic: truncate_to_bytes(&diagnostic.into(), MAX_DIAGNOSTIC_BYTES),
+            diagnostic: truncate_to_bytes(&diagnostic.into(), Self::MAX_DIAGNOSTIC_BYTES),
         }
     }
 
@@ -296,7 +293,7 @@ impl DeliveryResult {
             status: DeliveryStatus::ProtocolRejection,
             ambiguous: false,
             smtp_code,
-            diagnostic: truncate_to_bytes(&diagnostic.into(), MAX_DIAGNOSTIC_BYTES),
+            diagnostic: truncate_to_bytes(&diagnostic.into(), Self::MAX_DIAGNOSTIC_BYTES),
         }
     }
 
@@ -309,7 +306,7 @@ impl DeliveryResult {
             status: DeliveryStatus::TemporaryFailure,
             ambiguous: true,
             smtp_code: None,
-            diagnostic: truncate_to_bytes(&diagnostic.into(), MAX_DIAGNOSTIC_BYTES),
+            diagnostic: truncate_to_bytes(&diagnostic.into(), Self::MAX_DIAGNOSTIC_BYTES),
         }
     }
 
@@ -342,12 +339,6 @@ pub struct Envelope {
     recipients: Vec<Vec<u8>>,
 }
 
-/// Maximum bytes for a single envelope address (RFC 5321 §4.5.3.1).
-const MAX_ADDRESS_BYTES: usize = 254;
-
-/// Maximum number of recipients per envelope.
-const MAX_RECIPIENTS: usize = 100;
-
 /// Validation errors for [`Envelope`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EnvelopeError {
@@ -378,7 +369,7 @@ impl Envelope {
         if recipients.is_empty() {
             return Err(EnvelopeError::NoRecipients);
         }
-        if recipients.len() > MAX_RECIPIENTS {
+        if recipients.len() > Self::MAX_RECIPIENTS {
             return Err(EnvelopeError::TooManyRecipients(recipients.len()));
         }
         for rcpt in &recipients {
@@ -408,9 +399,9 @@ impl Envelope {
 /// Validate a single bare addr-spec.
 ///
 /// Rules: ASCII printable (0x20–0x7E) only, no control bytes (including
-/// CR/LF), no spaces, no angle brackets, max [`MAX_ADDRESS_BYTES`] bytes.
+/// CR/LF), no spaces, no angle brackets, max [`Envelope::MAX_ADDRESS_BYTES`] bytes.
 fn validate_address(addr: &[u8]) -> Result<(), EnvelopeError> {
-    if addr.len() > MAX_ADDRESS_BYTES {
+    if addr.len() > Envelope::MAX_ADDRESS_BYTES {
         return Err(EnvelopeError::AddressTooLong(addr.len()));
     }
     for &b in addr {
@@ -535,12 +526,12 @@ mod tests {
         let long = "a".repeat(6000);
         let r = DeliveryResult::temporary_failure(&long, None);
         assert!(
-            r.diagnostic.len() <= MAX_DIAGNOSTIC_BYTES,
+            r.diagnostic.len() <= DeliveryResult::MAX_DIAGNOSTIC_BYTES,
             "diagnostic should be <= {} bytes, got {}",
-            MAX_DIAGNOSTIC_BYTES,
+            DeliveryResult::MAX_DIAGNOSTIC_BYTES,
             r.diagnostic.len()
         );
-        assert_eq!(r.diagnostic.len(), MAX_DIAGNOSTIC_BYTES);
+        assert_eq!(r.diagnostic.len(), DeliveryResult::MAX_DIAGNOSTIC_BYTES);
     }
 
     #[test]
@@ -552,9 +543,9 @@ mod tests {
 
     #[test]
     fn diagnostic_exactly_at_boundary_preserved() {
-        let msg = "x".repeat(MAX_DIAGNOSTIC_BYTES);
+        let msg = "x".repeat(DeliveryResult::MAX_DIAGNOSTIC_BYTES);
         let r = DeliveryResult::permanent_failure(&msg, None);
-        assert_eq!(r.diagnostic.len(), MAX_DIAGNOSTIC_BYTES);
+        assert_eq!(r.diagnostic.len(), DeliveryResult::MAX_DIAGNOSTIC_BYTES);
     }
 
     #[test]
@@ -570,9 +561,9 @@ mod tests {
 
         // Must not exceed the byte budget.
         assert!(
-            r.diagnostic.len() <= MAX_DIAGNOSTIC_BYTES,
+            r.diagnostic.len() <= DeliveryResult::MAX_DIAGNOSTIC_BYTES,
             "diagnostic bytes must be <= {}, got {}",
-            MAX_DIAGNOSTIC_BYTES,
+            DeliveryResult::MAX_DIAGNOSTIC_BYTES,
             r.diagnostic.len()
         );
 
@@ -583,7 +574,7 @@ mod tests {
         );
 
         // 4096 / 3 = 1365 remainder 1, so we expect exactly 1365 full euro chars.
-        let expected_chars = MAX_DIAGNOSTIC_BYTES / 3; // 1365
+        let expected_chars = DeliveryResult::MAX_DIAGNOSTIC_BYTES / 3; // 1365
         assert_eq!(r.diagnostic.chars().count(), expected_chars);
     }
 
@@ -597,11 +588,11 @@ mod tests {
 
         let r = DeliveryResult::permanent_failure(&long_grin, None);
 
-        assert!(r.diagnostic.len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(r.diagnostic.len() <= DeliveryResult::MAX_DIAGNOSTIC_BYTES);
         assert!(std::str::from_utf8(r.diagnostic.as_bytes()).is_ok());
 
         // 4096 / 4 = 1024 exact chars.
-        let expected_chars = MAX_DIAGNOSTIC_BYTES / 4; // 1024
+        let expected_chars = DeliveryResult::MAX_DIAGNOSTIC_BYTES / 4; // 1024
         assert_eq!(r.diagnostic.chars().count(), expected_chars);
     }
 
