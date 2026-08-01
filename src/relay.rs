@@ -144,6 +144,8 @@ pub enum EnvelopeError {
     AddressTooLong(usize),
     /// Recipient list is empty.
     NoRecipients,
+    /// A recipient address is empty (zero-length bare addr-spec).
+    EmptyRecipientAddress,
     /// Too many recipients (exceeds [`MAX_RECIPIENTS`]).
     TooManyRecipients(usize),
 }
@@ -167,6 +169,9 @@ impl Envelope {
             return Err(EnvelopeError::TooManyRecipients(recipients.len()));
         }
         for rcpt in &recipients {
+            if rcpt.is_empty() {
+                return Err(EnvelopeError::EmptyRecipientAddress);
+            }
             validate_address(rcpt)?;
         }
 
@@ -520,6 +525,14 @@ mod tests {
             Envelope::new(b"sender@example.com", rcpts).is_ok(),
             "100 recipients should be accepted"
         );
+    }
+
+    #[test]
+    fn envelope_rejects_empty_recipient_address() {
+        // A recipient with an empty bare addr-spec must be rejected.
+        let result = Envelope::new(b"sender@example.com", vec![b"".to_vec()]);
+        assert!(result.is_err(), "empty recipient address must be rejected");
+        assert_eq!(result.unwrap_err(), EnvelopeError::EmptyRecipientAddress,);
     }
 
     #[test]
