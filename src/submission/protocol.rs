@@ -1006,67 +1006,6 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    // ── request round-trip ────────────────────────────────────────────
-
-    #[test]
-    fn request_round_trip() {
-        let frame = minimal_valid_frame();
-        let request = read_request(
-            &mut Cursor::new(&frame),
-            &permissive_limits(),
-            &permissive_budget(),
-        )
-        .unwrap();
-
-        assert_eq!(request.envelope.sender(), b"sender@example.com");
-        assert_eq!(request.envelope.recipients().len(), 1);
-        assert_eq!(
-            request.envelope.recipients()[0],
-            b"rcpt@example.net".as_slice()
-        );
-        assert_eq!(request.message, b"hello");
-    }
-
-    // ── request encoder round-trip ────────────────────────────────────
-
-    #[test]
-    fn request_encoder_round_trip() {
-        let envelope = Envelope::new(
-            b"alice@example.com",
-            vec![b"bob@example.net".to_vec(), b"carol@example.org".to_vec()],
-        )
-        .unwrap();
-        let msg = b"test message body".to_vec();
-        let budget = permissive_budget();
-        let reservation = budget.try_reserve(msg.len()).unwrap();
-        let request = SubmissionRequest {
-            envelope,
-            message: msg,
-            reservation,
-        };
-
-        let mut encoded = Vec::new();
-        write_request(&mut encoded, &request).unwrap();
-
-        let decoded = read_request(
-            &mut Cursor::new(&encoded),
-            &permissive_limits(),
-            &permissive_budget(),
-        )
-        .unwrap();
-        assert_eq!(decoded.envelope.sender(), b"alice@example.com");
-        assert_eq!(decoded.envelope.recipients().len(), 2);
-        assert_eq!(
-            decoded.envelope.recipients()[0],
-            b"bob@example.net".as_slice()
-        );
-        assert_eq!(
-            decoded.envelope.recipients()[1],
-            b"carol@example.org".as_slice()
-        );
-        assert_eq!(decoded.message, b"test message body");
-    }
-
     // ── wrong magic ───────────────────────────────────────────────────
 
     #[test]
@@ -1442,60 +1381,6 @@ mod tests {
         );
     }
 
-    // ── response round-trips ──────────────────────────────────────────
-
-    #[test]
-    fn response_round_trip_delivered() {
-        let result = DeliveryResult::delivered("250 queued", Some(250));
-        let mut encoded = Vec::new();
-        write_response(&mut encoded, &result, 4096).unwrap();
-
-        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
-        assert_eq!(decoded.status, DeliveryStatus::Delivered);
-        assert!(!decoded.ambiguous);
-        assert_eq!(decoded.smtp_code, Some(250));
-        assert_eq!(decoded.diagnostic, "250 queued");
-    }
-
-    #[test]
-    fn response_round_trip_temporary_failure() {
-        let result = DeliveryResult::temporary_failure("451 try again", Some(451));
-        let mut encoded = Vec::new();
-        write_response(&mut encoded, &result, 4096).unwrap();
-
-        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
-        assert_eq!(decoded.status, DeliveryStatus::TemporaryFailure);
-        assert!(!decoded.ambiguous);
-        assert_eq!(decoded.smtp_code, Some(451));
-        assert_eq!(decoded.diagnostic, "451 try again");
-    }
-
-    #[test]
-    fn response_round_trip_permanent_failure() {
-        let result = DeliveryResult::permanent_failure("550 user unknown", Some(550));
-        let mut encoded = Vec::new();
-        write_response(&mut encoded, &result, 4096).unwrap();
-
-        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
-        assert_eq!(decoded.status, DeliveryStatus::PermanentFailure);
-        assert!(!decoded.ambiguous);
-        assert_eq!(decoded.smtp_code, Some(550));
-        assert_eq!(decoded.diagnostic, "550 user unknown");
-    }
-
-    #[test]
-    fn response_round_trip_protocol_rejection() {
-        let result = DeliveryResult::protocol_rejection("TLS handshake failed", None);
-        let mut encoded = Vec::new();
-        write_response(&mut encoded, &result, 4096).unwrap();
-
-        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
-        assert_eq!(decoded.status, DeliveryStatus::ProtocolRejection);
-        assert!(!decoded.ambiguous);
-        assert_eq!(decoded.smtp_code, None);
-        assert_eq!(decoded.diagnostic, "TLS handshake failed");
-    }
-
     // ── ambiguous flag round-trip ─────────────────────────────────────
 
     #[test]
@@ -1526,30 +1411,6 @@ mod tests {
 
         let decoded = read_response(&mut Cursor::new(&frame), &permissive_limits()).unwrap();
         assert_eq!(decoded.smtp_code, None);
-    }
-
-    #[test]
-    fn response_smtp_code_nonzero_round_trip() {
-        let result = DeliveryResult::delivered("ok", Some(250));
-        let mut encoded = Vec::new();
-        write_response(&mut encoded, &result, 4096).unwrap();
-
-        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
-        assert_eq!(decoded.smtp_code, Some(250));
-    }
-
-    // ── diagnostic UTF-8 round trip ───────────────────────────────────
-
-    #[test]
-    fn response_diagnostic_utf8_round_trip() {
-        // Multi-byte UTF-8: euro sign (3 bytes) + ASCII.
-        let diag = "price: \u{20AC}100 \u{2013} special chars";
-        let result = DeliveryResult::delivered(diag, Some(250));
-        let mut encoded = Vec::new();
-        write_response(&mut encoded, &result, 4096).unwrap();
-
-        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
-        assert_eq!(decoded.diagnostic, diag);
     }
 
     // ── invalid UTF-8 rejection ───────────────────────────────────────

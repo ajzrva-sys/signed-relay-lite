@@ -648,8 +648,7 @@ fn max_active_handlers_bounds_gated_clients() {
     peer.join().unwrap();
 }
 
-#[test]
-fn parse_and_frame_failures_are_bounded_and_never_delivered() {
+fn assert_protocol_rejection(bytes: &[u8]) {
     let path = TestPath::new();
     let limits = submission_limits();
     let Some((shutdown, server)) = start_server(
@@ -662,18 +661,28 @@ fn parse_and_frame_failures_are_bounded_and_never_delivered() {
     ) else {
         return;
     };
-    for bytes in [
-        b"NOPE".as_slice(),
-        request(b"invalid message\r\n").as_slice(),
-        request(b"From: sender@wrong.example\r\n\r\nbody\r\n").as_slice(),
-    ] {
-        let mut client = UnixStream::connect(&path.0).unwrap();
-        client.write_all(bytes).unwrap();
-        let result = read_result(&mut client, &limits);
-        assert_ne!(result.status, DeliveryStatus::Delivered);
-        assert!(result.diagnostic.len() <= limits.max_diagnostic_bytes);
-    }
+    let mut client = UnixStream::connect(&path.0).unwrap();
+    client.write_all(bytes).unwrap();
+    let result = read_result(&mut client, &limits);
+    assert_eq!(result.status, DeliveryStatus::ProtocolRejection);
+    assert!(!result.ambiguous);
+    assert!(result.diagnostic.len() <= limits.max_diagnostic_bytes);
     stop_server(shutdown, server);
+}
+
+#[test]
+fn malformed_frame_is_a_bounded_protocol_rejection() {
+    assert_protocol_rejection(b"NOPE");
+}
+
+#[test]
+fn malformed_message_is_a_bounded_protocol_rejection() {
+    assert_protocol_rejection(&request(b"invalid message\r\n"));
+}
+
+#[test]
+fn dkim_domain_rejection_is_a_bounded_protocol_rejection() {
+    assert_protocol_rejection(&request(b"From: sender@wrong.example\r\n\r\nbody\r\n"));
 }
 
 #[test]

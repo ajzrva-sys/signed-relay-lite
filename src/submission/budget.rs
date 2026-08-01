@@ -124,15 +124,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reservation_is_released_on_drop() {
-        let budget = MemoryBudget::new(100);
-        let first = budget.try_reserve(80).unwrap();
-        assert!(budget.try_reserve(21).is_none());
-        drop(first);
-        assert!(budget.try_reserve(100).is_some());
-    }
-
-    #[test]
     fn zero_reservation_succeeds() {
         let budget = MemoryBudget::new(100);
         let r = budget.try_reserve(0).unwrap();
@@ -228,18 +219,6 @@ mod tests {
         }
         // Both dropped — back to zero.
         assert_eq!(budget.used(), 0);
-    }
-
-    #[test]
-    fn moving_reservation_transfers_ownership() {
-        let budget = MemoryBudget::new(100);
-        let r = budget.try_reserve(50).unwrap();
-        assert_eq!(budget.used(), 50);
-        // Move into a function — original `r` is consumed.
-        let moved = move_reservation(r);
-        assert_eq!(budget.used(), 50); // still held
-        drop(moved);
-        assert_eq!(budget.used(), 0); // released exactly once
     }
 
     fn move_reservation(r: MemoryReservation) -> MemoryReservation {

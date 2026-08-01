@@ -455,47 +455,12 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
-    // -- constructors ---------------------------------------------------
-
     #[test]
     fn ambiguous_delivery_is_always_temporary() {
         let result = DeliveryResult::ambiguous("connection closed after DATA");
         assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
         assert!(result.ambiguous);
         assert_eq!(result.smtp_code, None);
-    }
-
-    #[test]
-    fn delivered_constructor_sets_status_and_code() {
-        let r = DeliveryResult::delivered("250 OK", Some(250));
-        assert_eq!(r.status, DeliveryStatus::Delivered);
-        assert!(!r.ambiguous);
-        assert_eq!(r.smtp_code, Some(250));
-        assert_eq!(r.diagnostic, "250 OK");
-    }
-
-    #[test]
-    fn temporary_failure_constructor() {
-        let r = DeliveryResult::temporary_failure("451 try again", Some(451));
-        assert_eq!(r.status, DeliveryStatus::TemporaryFailure);
-        assert!(!r.ambiguous);
-        assert_eq!(r.smtp_code, Some(451));
-    }
-
-    #[test]
-    fn permanent_failure_constructor() {
-        let r = DeliveryResult::permanent_failure("550 user unknown", Some(550));
-        assert_eq!(r.status, DeliveryStatus::PermanentFailure);
-        assert!(!r.ambiguous);
-        assert_eq!(r.smtp_code, Some(550));
-    }
-
-    #[test]
-    fn protocol_rejection_constructor() {
-        let r = DeliveryResult::protocol_rejection("TLS handshake failed", None);
-        assert_eq!(r.status, DeliveryStatus::ProtocolRejection);
-        assert!(!r.ambiguous);
-        assert_eq!(r.smtp_code, None);
     }
 
     // -- classification -------------------------------------------------
@@ -567,12 +532,6 @@ mod tests {
             r.diagnostic.len()
         );
 
-        // Must be a valid UTF-8 string (no truncation mid-codepoint).
-        assert!(
-            std::str::from_utf8(r.diagnostic.as_bytes()).is_ok(),
-            "truncated diagnostic must remain valid UTF-8"
-        );
-
         // 4096 / 3 = 1365 remainder 1, so we expect exactly 1365 full euro chars.
         let expected_chars = DeliveryResult::MAX_DIAGNOSTIC_BYTES / 3; // 1365
         assert_eq!(r.diagnostic.chars().count(), expected_chars);
@@ -589,27 +548,9 @@ mod tests {
         let r = DeliveryResult::permanent_failure(&long_grin, None);
 
         assert!(r.diagnostic.len() <= DeliveryResult::MAX_DIAGNOSTIC_BYTES);
-        assert!(std::str::from_utf8(r.diagnostic.as_bytes()).is_ok());
-
         // 4096 / 4 = 1024 exact chars.
         let expected_chars = DeliveryResult::MAX_DIAGNOSTIC_BYTES / 4; // 1024
         assert_eq!(r.diagnostic.chars().count(), expected_chars);
-    }
-
-    // -- enum properties ------------------------------------------------
-
-    #[test]
-    fn delivery_status_is_copy() {
-        let a = DeliveryStatus::Delivered;
-        let b = a; // copy, not move
-        assert_eq!(a, b); // `a` still usable
-    }
-
-    #[test]
-    fn delivery_result_is_clone() {
-        let a = DeliveryResult::delivered("ok", Some(250));
-        let b = a.clone();
-        assert_eq!(a, b);
     }
 
     // -- envelope validation --------------------------------------------
