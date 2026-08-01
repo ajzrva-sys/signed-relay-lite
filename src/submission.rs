@@ -868,7 +868,8 @@ fn handle_stream(
     relay: &RelayPool,
 ) {
     let setup = stream
-        .set_read_timeout(Some(timeout))
+        .set_nonblocking(false)
+        .and_then(|()| stream.set_read_timeout(Some(timeout)))
         .and_then(|()| stream.set_write_timeout(Some(timeout)));
     let result = if let Err(error) = setup {
         DeliveryResult::temporary_failure(format!("submission socket setup failed: {error}"), None)

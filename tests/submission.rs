@@ -3,6 +3,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -14,7 +15,7 @@ use signed_relay_lite::message::Limits as MessageLimits;
 use signed_relay_lite::relay::{DeliveryResult, DeliveryStatus, RelayPool};
 use signed_relay_lite::smtp::{SmtpConnection, SmtpStream};
 use signed_relay_lite::submission::{
-    read_response, MemoryBudget, SubmissionLimits, SubmissionServer,
+    read_request, read_response, MemoryBudget, SubmissionLimits, SubmissionServer,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
@@ -23,7 +24,7 @@ struct TestPath(PathBuf);
 
 impl TestPath {
     fn new() -> Self {
-        Self(Path::new("/private/tmp").join(format!(
+        Self(std::env::current_dir().unwrap().join(format!(
             "srl-{}-{}",
             std::process::id(),
             NEXT_PATH.fetch_add(1, Ordering::Relaxed)
@@ -341,7 +342,12 @@ fn slow_truncated_client_times_out_with_bounded_non_delivered_outcome() {
     };
     let mut client = UnixStream::connect(&path.0).unwrap();
     client.write_all(b"SRL1").unwrap();
+    let started = std::time::Instant::now();
     let result = read_result(&mut client, &limits);
+    assert!(
+        started.elapsed() >= Duration::from_millis(40),
+        "truncated client was rejected before the configured read timeout"
+    );
     assert_ne!(result.status, DeliveryStatus::Delivered);
     assert!(result.diagnostic.len() <= limits.max_diagnostic_bytes);
     stop_server(shutdown, server);
@@ -576,4 +582,254 @@ fn rejects_zero_timeout_zero_mode_and_special_mode_bits() {
         make(0o4660, Duration::from_secs(1)).err().unwrap().kind(),
         io::ErrorKind::InvalidInput
     );
+}
+
+fn sendmail_command(path: &Path, args: &[&str], stdin: &[u8]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_signed-relay-sendmail"))
+        .args(args)
+        .env("SIGNED_RELAY_SOCKET", path)
+        .env("SIGNED_RELAY_CREDENTIAL", "credential-sentinel-7f21")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("sendmail client exceeded two seconds: {output:?}");
+        }
+        std::thread::yield_now();
+    }
+}
+
+fn response(status: u8, ambiguous: bool, diagnostic: &[u8]) -> Vec<u8> {
+    let mut frame = b"SRL1".to_vec();
+    frame.push(status);
+    frame.push(u8::from(ambiguous));
+    frame.extend_from_slice(&0_u16.to_be_bytes());
+    frame.extend_from_slice(&(diagnostic.len() as u32).to_be_bytes());
+    frame.extend_from_slice(diagnostic);
+    frame
+}
+
+struct RecordingReader<'a> {
+    stream: &'a mut UnixStream,
+    bytes: Vec<u8>,
+}
+
+impl Read for RecordingReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.stream.read(buffer)?;
+        self.bytes.extend_from_slice(&buffer[..read]);
+        Ok(read)
+    }
+}
+
+fn serve_one(
+    path: &Path,
+    reply: Vec<u8>,
+) -> Option<(mpsc::Receiver<Vec<u8>>, std::thread::JoinHandle<()>)> {
+    let listener = match UnixListener::bind(path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return None,
+        Err(error) => panic!("bind test socket: {error}"),
+    };
+    listener.set_nonblocking(true).unwrap();
+    let (tx, rx) = mpsc::sync_channel(1);
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "client did not connect"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("accept client: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut recording = RecordingReader {
+            stream: &mut stream,
+            bytes: Vec::new(),
+        };
+        let limits = SubmissionLimits {
+            max_recipients: 100,
+            max_address_bytes: 254,
+            max_message_bytes: 26_214_400,
+            max_diagnostic_bytes: 4096,
+        };
+        let request =
+            read_request(&mut recording, &limits, &MemoryBudget::new(26_214_400)).unwrap();
+        drop(request);
+        tx.send(recording.bytes).unwrap();
+        stream.write_all(&reply).unwrap();
+    });
+    Some((rx, handle))
+}
+
+fn assert_request(frame: &[u8], sender: &[u8], recipients: &[&[u8]], message: &[u8]) {
+    let mut expected = b"SRL1".to_vec();
+    expected.extend_from_slice(&0_u32.to_be_bytes());
+    expected.extend_from_slice(&(sender.len() as u32).to_be_bytes());
+    expected.extend_from_slice(sender);
+    expected.extend_from_slice(&(recipients.len() as u32).to_be_bytes());
+    for recipient in recipients {
+        expected.extend_from_slice(&(recipient.len() as u32).to_be_bytes());
+        expected.extend_from_slice(recipient);
+    }
+    expected.extend_from_slice(&(message.len() as u64).to_be_bytes());
+    expected.extend_from_slice(message);
+    assert_eq!(frame, expected);
+}
+
+#[test]
+fn sendmail_normalizes_stdin_and_encodes_exact_envelope() {
+    let path = TestPath::new();
+    let Some((captured, server)) = serve_one(&path.0, response(0, false, b"delivered")) else {
+        return;
+    };
+    let input = b"From: sender@example.com\nSubject: lines\r\n\rbody\n";
+    let output = sendmail_command(
+        &path.0,
+        &[
+            "-f",
+            "sender@example.com",
+            "one@example.net",
+            "two@example.net",
+        ],
+        input,
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert_request(
+        &captured.recv_timeout(Duration::from_secs(2)).unwrap(),
+        b"sender@example.com",
+        &[b"one@example.net", b"two@example.net"],
+        b"From: sender@example.com\r\nSubject: lines\r\n\r\nbody\r\n",
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn sendmail_accepts_explicit_null_sender_and_double_dash_recipients() {
+    let path = TestPath::new();
+    let Some((captured, server)) = serve_one(&path.0, response(0, false, b"")) else {
+        return;
+    };
+    let output = sendmail_command(
+        &path.0,
+        &["-f", "", "--", "-recipient@example.net"],
+        b"X: y\n\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    assert_request(
+        &captured.recv_timeout(Duration::from_secs(2)).unwrap(),
+        b"",
+        &[b"-recipient@example.net"],
+        b"X: y\r\n\r\n",
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn sendmail_usage_errors_exit_64_without_connecting() {
+    for args in [
+        vec!["recipient@example.net"],
+        vec!["-f", "sender@example.com"],
+        vec!["-x", "recipient@example.net"],
+        vec![
+            "-f",
+            "a@example.com",
+            "-f",
+            "b@example.com",
+            "r@example.net",
+        ],
+    ] {
+        let path = TestPath::new();
+        let listener = match UnixListener::bind(&path.0) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("bind test socket: {error}"),
+        };
+        listener.set_nonblocking(true).unwrap();
+        let output = sendmail_command(&path.0, &args, b"secret message sentinel\n");
+        assert_eq!(output.status.code(), Some(64), "args: {args:?}");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+    }
+}
+
+#[test]
+fn sendmail_maps_all_server_results_and_bounds_diagnostics() {
+    for (status, ambiguous, expected) in [
+        (0, false, 0),
+        (1, false, 75),
+        (0, true, 75),
+        (2, false, 69),
+        (3, false, 64),
+    ] {
+        let path = TestPath::new();
+        let diagnostic = vec![b'd'; 4096];
+        let Some((captured, server)) = serve_one(&path.0, response(status, ambiguous, &diagnostic))
+        else {
+            return;
+        };
+        let output = sendmail_command(
+            &path.0,
+            &["-f", "a@example.com", "b@example.net"],
+            b"private-message-91\n",
+        );
+        assert_eq!(output.status.code(), Some(expected));
+        assert!(output.stderr.len() <= 4352);
+        assert!(!output
+            .stderr
+            .windows(b"private-message-91".len())
+            .any(|w| w == b"private-message-91"));
+        assert!(!output
+            .stderr
+            .windows(b"credential-sentinel-7f21".len())
+            .any(|w| w == b"credential-sentinel-7f21"));
+        captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn sendmail_connection_failure_and_relative_socket_are_classified() {
+    let missing = TestPath::new();
+    let output = sendmail_command(
+        &missing.0,
+        &["-f", "a@example.com", "b@example.net"],
+        b"X: y\n\n",
+    );
+    assert_eq!(output.status.code(), Some(75));
+    assert!(!output
+        .stderr
+        .windows(b"credential-sentinel-7f21".len())
+        .any(|w| w == b"credential-sentinel-7f21"));
+
+    let output = sendmail_command(
+        Path::new("relative.sock"),
+        &["-f", "a@example.com", "b@example.net"],
+        b"X: y\n\n",
+    );
+    assert_eq!(output.status.code(), Some(64));
 }
