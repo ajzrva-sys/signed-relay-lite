@@ -7,19 +7,20 @@
 //! # Wire format — Request
 //!
 //! ```text
-//! [magic: 4B "SRL1"] [flags: 1B]
-//! [sender_len: 2B BE] [sender: NB]
-//! [rcpt_count: 2B BE]
-//!   [for each: rcpt_len: 2B BE, rcpt: NB]
-//! [msg_len: 8B BE] [msg: NB]
+//! [magic: 4B "SRL1"] [flags: 4B u32 BE]
+//! [sender_len: 4B u32 BE] [sender: NB]
+//! [rcpt_count: 4B u32 BE]
+//!   [for each: rcpt_len: 4B u32 BE, rcpt: NB]
+//! [msg_len: 8B u64 BE] [msg: NB]
 //! ```
 //!
 //! # Wire format — Response
 //!
 //! ```text
-//! [status: 1B] [ambiguous: 1B]
-//! [smtp_code: 2B BE]            (0 ↔ None)
-//! [diag_len: 2B BE] [diag: NB]  (UTF-8)
+//! [magic: 4B "SRL1"]
+//! [status: 1B] [flags: 1B (bit0 = ambiguous)]
+//! [smtp_code: 2B BE]              (0 ↔ None)
+//! [diagnostic_len: 4B u32 BE]     [diagnostic: NB] (UTF-8)
 //! ```
 
 use std::io::{self, Read, Write};
@@ -31,8 +32,14 @@ use crate::relay::{DeliveryResult, DeliveryStatus, Envelope, EnvelopeError};
 /// Protocol magic bytes.
 const MAGIC: &[u8; 4] = b"SRL1";
 
-/// Currently supported flags value (none set).
-const FLAGS_V0: u8 = 0x00;
+/// Currently supported request flags value (none set).
+const REQUEST_FLAGS_V0: u32 = 0x0000_0000;
+
+/// Bitmask of known request flag bits.
+const REQUEST_FLAGS_KNOWN: u32 = 0x0000_0000;
+
+/// Currently supported response flags: bit0 = ambiguous.
+const RESPONSE_FLAGS_KNOWN: u8 = 0b0000_0001;
 
 /// Wire status byte for `DeliveryStatus::Delivered`.
 const STATUS_DELIVERED: u8 = 0;
@@ -42,6 +49,9 @@ const STATUS_TEMPORARY: u8 = 1;
 const STATUS_PERMANENT: u8 = 2;
 /// Wire status byte for `DeliveryStatus::ProtocolRejection`.
 const STATUS_PROTOCOL: u8 = 3;
+
+/// Default maximum message size from the approved plan (25 MiB).
+const DEFAULT_MAX_MESSAGE_BYTES: u64 = 26_214_400;
 
 // ── Limits ────────────────────────────────────────────────────────────
 
@@ -67,7 +77,7 @@ impl SubmissionLimits {
         Self {
             max_recipients: 100,
             max_address_bytes: 254,
-            max_message_bytes: 50 * 1024 * 1024, // 50 MiB
+            max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             max_diagnostic_bytes: 4096,
         }
     }
@@ -80,8 +90,12 @@ impl SubmissionLimits {
 pub enum SubmissionError {
     /// Wire magic is not `SRL1`.
     InvalidMagic,
-    /// Flags byte contains unknown bits.
-    UnknownFlags(u8),
+    /// Request flags contain unknown bits.
+    UnknownRequestFlags(u32),
+    /// Response flags contain unknown bits.
+    UnknownResponseFlags(u8),
+    /// Response status byte is not a recognized variant.
+    InvalidResponseStatus(u8),
     /// Declared recipient count exceeds the configured limit.
     TooManyRecipients { count: usize, limit: usize },
     /// An address field exceeds the configured limit.
@@ -140,6 +154,29 @@ fn read_u16<R: Read>(r: &mut R) -> Result<u16, SubmissionError> {
     Ok(u16::from_be_bytes(buf))
 }
 
+/// Read a big-endian `u32`, then validate it fits in `usize` and is <= limit.
+fn read_u32_limited<R: Read>(
+    r: &mut R,
+    limit: usize,
+    too_long: impl Fn(usize, usize) -> SubmissionError,
+) -> Result<usize, SubmissionError> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    let len = u32::from_be_bytes(buf);
+    let len_usize = usize::try_from(len).map_err(|_| too_long(len as usize, limit))?;
+    if len_usize > limit {
+        return Err(too_long(len_usize, limit));
+    }
+    Ok(len_usize)
+}
+
+/// Read a big-endian `u32` with no limit check (used for recipient count).
+fn read_u32<R: Read>(r: &mut R) -> Result<u32, SubmissionError> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(u32::from_be_bytes(buf))
+}
+
 /// Read a big-endian `u64`, then validate it fits in `usize` and is <= limit.
 ///
 /// Returns the value as `usize` if valid, or an appropriate error.
@@ -157,6 +194,11 @@ fn read_message_len<R: Read>(r: &mut R, limit: u64) -> Result<usize, SubmissionE
 
 /// Write a big-endian `u16`.
 fn write_u16<W: Write>(w: &mut W, v: u16) -> Result<(), io::Error> {
+    w.write_all(&v.to_be_bytes())
+}
+
+/// Write a big-endian `u32`.
+fn write_u32<W: Write>(w: &mut W, v: u32) -> Result<(), io::Error> {
     w.write_all(&v.to_be_bytes())
 }
 
@@ -195,20 +237,28 @@ pub fn read_request<R: Read>(
         return Err(SubmissionError::InvalidMagic);
     }
 
-    // Flags (1 byte)
-    let mut flags_buf = [0u8; 1];
-    r.read_exact(&mut flags_buf)?;
-    let flags = flags_buf[0];
-    if flags != FLAGS_V0 {
-        return Err(SubmissionError::UnknownFlags(flags));
+    // Flags (u32 BE)
+    let flags = read_u32(r)?;
+    if flags & !REQUEST_FLAGS_KNOWN != 0 {
+        // Only bits not in REQUEST_FLAGS_KNOWN are unknown.
+        // Since REQUEST_FLAGS_KNOWN is 0, any non-zero flags are unknown.
+        // We cast to the lower byte for the error variant to keep a small payload.
+        return Err(SubmissionError::UnknownRequestFlags(flags));
     }
 
-    // Sender (length-prefixed, u16)
-    let sender_len = read_u16(r)? as usize;
+    // Sender (length-prefixed, u32 BE — check limit before allocation)
+    let sender_len = read_u32_limited(r, limits.max_address_bytes, |len, limit| {
+        SubmissionError::AddressTooLong { len, limit }
+    })?;
     let sender = read_bytes(r, sender_len)?;
 
-    // Recipient count (u16, checked before reading recipients)
-    let rcpt_count = read_u16(r)? as usize;
+    // Recipient count (u32 BE, checked before reading recipients)
+    let rcpt_count_raw = read_u32(r)?;
+    let rcpt_count =
+        usize::try_from(rcpt_count_raw).map_err(|_| SubmissionError::TooManyRecipients {
+            count: rcpt_count_raw as usize,
+            limit: limits.max_recipients,
+        })?;
     if rcpt_count > limits.max_recipients {
         return Err(SubmissionError::TooManyRecipients {
             count: rcpt_count,
@@ -216,20 +266,16 @@ pub fn read_request<R: Read>(
         });
     }
 
-    // Recipients (each length-prefixed, validated against address limit)
+    // Recipients (each length-prefixed u32 BE, validated against address limit)
     let mut recipients = Vec::with_capacity(rcpt_count);
     for _ in 0..rcpt_count {
-        let addr_len = read_u16(r)? as usize;
-        if addr_len > limits.max_address_bytes {
-            return Err(SubmissionError::AddressTooLong {
-                len: addr_len,
-                limit: limits.max_address_bytes,
-            });
-        }
+        let addr_len = read_u32_limited(r, limits.max_address_bytes, |len, limit| {
+            SubmissionError::AddressTooLong { len, limit }
+        })?;
         recipients.push(read_bytes(r, addr_len)?);
     }
 
-    // Message length (u64, checked conversion to usize)
+    // Message length (u64 BE, checked conversion to usize)
     let msg_len = read_message_len(r, limits.max_message_bytes)?;
     let message = read_bytes(r, msg_len)?;
 
@@ -243,24 +289,24 @@ pub fn read_request<R: Read>(
 pub fn write_request<W: Write>(w: &mut W, request: &SubmissionRequest) -> Result<(), io::Error> {
     // Magic
     w.write_all(MAGIC)?;
-    // Flags
-    w.write_all(&[FLAGS_V0])?;
-    // Sender
+    // Flags (u32 BE)
+    write_u32(w, REQUEST_FLAGS_V0)?;
+    // Sender (u32 BE length + data)
     let sender = request.envelope.sender();
-    write_u16(w, u16::try_from(sender.len()).expect("sender exceeds u16"))?;
+    write_u32(w, u32::try_from(sender.len()).expect("sender exceeds u32"))?;
     w.write_all(sender)?;
-    // Recipient count
+    // Recipient count (u32 BE)
     let recipients = request.envelope.recipients();
-    write_u16(
+    write_u32(
         w,
-        u16::try_from(recipients.len()).expect("too many recipients"),
+        u32::try_from(recipients.len()).expect("too many recipients"),
     )?;
-    // Recipients
+    // Recipients (u32 BE length + data each)
     for rcpt in recipients {
-        write_u16(w, u16::try_from(rcpt.len()).expect("address exceeds u16"))?;
+        write_u32(w, u32::try_from(rcpt.len()).expect("address exceeds u32"))?;
         w.write_all(rcpt)?;
     }
-    // Message length + data
+    // Message length + data (u64 BE)
     write_u64(
         w,
         u64::try_from(request.message.len()).expect("message exceeds u64"),
@@ -278,7 +324,14 @@ pub fn read_response<R: Read>(
     r: &mut R,
     limits: &SubmissionLimits,
 ) -> Result<DeliveryResult, SubmissionError> {
-    // Status
+    // Magic (4 bytes) — required for responses too
+    let mut magic = [0u8; 4];
+    r.read_exact(&mut magic)?;
+    if magic != *MAGIC {
+        return Err(SubmissionError::InvalidMagic);
+    }
+
+    // Status (1 byte)
     let mut status_buf = [0u8; 1];
     r.read_exact(&mut status_buf)?;
     let status = match status_buf[0] {
@@ -286,30 +339,26 @@ pub fn read_response<R: Read>(
         STATUS_TEMPORARY => DeliveryStatus::TemporaryFailure,
         STATUS_PERMANENT => DeliveryStatus::PermanentFailure,
         STATUS_PROTOCOL => DeliveryStatus::ProtocolRejection,
-        other => return Err(SubmissionError::UnknownFlags(other)),
+        other => return Err(SubmissionError::InvalidResponseStatus(other)),
     };
 
-    // Ambiguous flag
-    let mut ambiguous_buf = [0u8; 1];
-    r.read_exact(&mut ambiguous_buf)?;
-    let ambiguous = match ambiguous_buf[0] {
-        0 => false,
-        1 => true,
-        other => return Err(SubmissionError::UnknownFlags(other)),
-    };
+    // Flags (1 byte, only bit0 = ambiguous)
+    let mut flags_buf = [0u8; 1];
+    r.read_exact(&mut flags_buf)?;
+    let flags = flags_buf[0];
+    if flags & !RESPONSE_FLAGS_KNOWN != 0 {
+        return Err(SubmissionError::UnknownResponseFlags(flags));
+    }
+    let ambiguous = flags & 0x01 != 0;
 
     // SMTP code (0 ↔ None)
     let smtp_raw = read_u16(r)?;
     let smtp_code = if smtp_raw == 0 { None } else { Some(smtp_raw) };
 
-    // Diagnostic (length-prefixed, UTF-8 validated)
-    let diag_len = read_u16(r)? as usize;
-    if diag_len > limits.max_diagnostic_bytes {
-        return Err(SubmissionError::DiagnosticTooLong {
-            len: diag_len,
-            limit: limits.max_diagnostic_bytes,
-        });
-    }
+    // Diagnostic (u32 BE length, UTF-8 validated)
+    let diag_len = read_u32_limited(r, limits.max_diagnostic_bytes, |len, limit| {
+        SubmissionError::DiagnosticTooLong { len, limit }
+    })?;
     let diag_bytes = read_bytes(r, diag_len)?;
     let diagnostic =
         String::from_utf8(diag_bytes).map_err(|_| SubmissionError::InvalidDiagnosticUtf8)?;
@@ -326,11 +375,21 @@ pub fn read_response<R: Read>(
 ///
 /// The diagnostic is defensively truncated to `max_diagnostic_bytes` at
 /// a UTF-8 boundary before encoding.
+///
+/// `max_diagnostic_bytes` is clamped to `min(4096, u32::MAX)` to prevent
+/// panic when the configured limit exceeds `u32::MAX`. The truncation
+/// always lands on a UTF-8 character boundary.
 pub fn write_response<W: Write>(
     w: &mut W,
     result: &DeliveryResult,
     max_diagnostic_bytes: usize,
 ) -> Result<(), io::Error> {
+    // Clamp max_diagnostic_bytes to u32::MAX, then to 4096 per plan.
+    let effective_max = max_diagnostic_bytes.min(u32::MAX as usize).min(4096);
+
+    // Magic
+    w.write_all(MAGIC)?;
+
     // Status
     let status_byte = match result.status {
         DeliveryStatus::Delivered => STATUS_DELIVERED,
@@ -340,18 +399,15 @@ pub fn write_response<W: Write>(
     };
     w.write_all(&[status_byte])?;
 
-    // Ambiguous
+    // Flags (bit0 = ambiguous)
     w.write_all(&[u8::from(result.ambiguous)])?;
 
     // SMTP code (None → 0)
     write_u16(w, result.smtp_code.unwrap_or(0))?;
 
-    // Diagnostic (truncate defensively, then encode)
-    let diag = truncate_to_utf8_boundary(&result.diagnostic, max_diagnostic_bytes);
-    write_u16(
-        w,
-        u16::try_from(diag.len()).expect("diagnostic exceeds u16"),
-    )?;
+    // Diagnostic (u32 BE length, truncate defensively)
+    let diag = truncate_to_utf8_boundary(&result.diagnostic, effective_max);
+    write_u32(w, diag.len() as u32)?;
     w.write_all(diag.as_bytes())?;
 
     Ok(())
@@ -368,6 +424,10 @@ mod tests {
 
     /// Build a minimal valid SRL1 request frame for "sender@example.com"
     /// → ["rcpt@example.net"] with message "hello".
+    ///
+    /// Uses the approved spec layout:
+    /// magic[4] flags[u32] sender_len[u32] sender rcpt_count[u32]
+    ///   rcpt_len[u32] rcpt msg_len[u64] msg
     fn minimal_valid_frame() -> Vec<u8> {
         let sender = b"sender@example.com";
         let rcpt = b"rcpt@example.net";
@@ -376,20 +436,35 @@ mod tests {
         let mut frame = Vec::new();
         // Magic
         frame.extend_from_slice(MAGIC);
-        // Flags = 0
-        frame.push(FLAGS_V0);
-        // Sender len + data
-        frame.extend_from_slice(&(sender.len() as u16).to_be_bytes());
+        // Flags = 0 (u32 BE)
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        // Sender len + data (u32 BE)
+        frame.extend_from_slice(&(sender.len() as u32).to_be_bytes());
         frame.extend_from_slice(sender);
-        // Recipient count = 1
-        frame.extend_from_slice(&1u16.to_be_bytes());
-        // Recipient 0 len + data
-        frame.extend_from_slice(&(rcpt.len() as u16).to_be_bytes());
+        // Recipient count = 1 (u32 BE)
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        // Recipient 0 len + data (u32 BE)
+        frame.extend_from_slice(&(rcpt.len() as u32).to_be_bytes());
         frame.extend_from_slice(rcpt);
-        // Message len + data
+        // Message len + data (u64 BE)
         frame.extend_from_slice(&(msg.len() as u64).to_be_bytes());
         frame.extend_from_slice(msg);
 
+        frame
+    }
+
+    /// Build a minimal valid SRL1 response frame.
+    ///
+    /// Uses the approved spec layout:
+    /// magic[4] status[u8] flags[u8] smtp_code[u16] diag_len[u32] diag
+    fn minimal_response_frame() -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC); // magic
+        frame.push(STATUS_DELIVERED); // status
+        frame.push(0x00); // flags: not ambiguous
+        frame.extend_from_slice(&250u16.to_be_bytes()); // smtp_code
+        frame.extend_from_slice(&2u32.to_be_bytes()); // diag_len = 2
+        frame.extend_from_slice(b"OK"); // diagnostic
         frame
     }
 
@@ -455,15 +530,16 @@ mod tests {
         assert_eq!(err, SubmissionError::InvalidMagic);
     }
 
-    // ── unknown flags ─────────────────────────────────────────────────
+    // ── unknown request flags ─────────────────────────────────────────
 
     #[test]
     fn reject_unknown_flags() {
         let mut frame = minimal_valid_frame();
-        frame[4] = 0xFF; // flags byte
+        // flags are at bytes 4..8 (u32 BE), set byte 7 = 0xFF
+        frame[7] = 0xFF;
 
         let err = read_request(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
-        assert_eq!(err, SubmissionError::UnknownFlags(0xFF));
+        assert_eq!(err, SubmissionError::UnknownRequestFlags(0xFF));
     }
 
     // ── recipient count over limit ────────────────────────────────────
@@ -480,14 +556,14 @@ mod tests {
 
         let mut frame = Vec::new();
         frame.extend_from_slice(MAGIC);
-        frame.push(FLAGS_V0);
-        frame.extend_from_slice(&(sender.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes()); // flags u32
+        frame.extend_from_slice(&(sender.len() as u32).to_be_bytes());
         frame.extend_from_slice(sender);
-        frame.extend_from_slice(&2u16.to_be_bytes()); // 2 recipients, limit is 1
+        frame.extend_from_slice(&2u32.to_be_bytes()); // 2 recipients, limit is 1
                                                       // Add recipient data so the frame isn't truncated (we want the
                                                       // rejection to happen at count validation, not at read).
         for _ in 0..2 {
-            frame.extend_from_slice(&(rcpt.len() as u16).to_be_bytes());
+            frame.extend_from_slice(&(rcpt.len() as u32).to_be_bytes());
             frame.extend_from_slice(rcpt);
         }
         frame.extend_from_slice(&(msg.len() as u64).to_be_bytes());
@@ -513,11 +589,11 @@ mod tests {
 
         let mut frame = Vec::new();
         frame.extend_from_slice(MAGIC);
-        frame.push(FLAGS_V0);
-        frame.extend_from_slice(&(sender.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes()); // flags u32
+        frame.extend_from_slice(&(sender.len() as u32).to_be_bytes());
         frame.extend_from_slice(sender);
-        frame.extend_from_slice(&1u16.to_be_bytes());
-        frame.extend_from_slice(&(rcpt.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&(rcpt.len() as u32).to_be_bytes());
         frame.extend_from_slice(rcpt);
         frame.extend_from_slice(&10u64.to_be_bytes()); // 10 bytes, limit is 4
         frame.extend_from_slice(b"0123456789");
@@ -535,11 +611,11 @@ mod tests {
 
         let mut frame = Vec::new();
         frame.extend_from_slice(MAGIC);
-        frame.push(FLAGS_V0);
-        frame.extend_from_slice(&(sender.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes()); // flags u32
+        frame.extend_from_slice(&(sender.len() as u32).to_be_bytes());
         frame.extend_from_slice(sender);
-        frame.extend_from_slice(&1u16.to_be_bytes());
-        frame.extend_from_slice(&(rcpt.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&(rcpt.len() as u32).to_be_bytes());
         frame.extend_from_slice(rcpt);
         frame.extend_from_slice(&u64::MAX.to_be_bytes()); // u64::MAX
 
@@ -591,7 +667,7 @@ mod tests {
 
     #[test]
     fn reject_truncated_at_flags() {
-        // 4 bytes magic, no flags byte.
+        // 4 bytes magic, no flags.
         let frame = &minimal_valid_frame()[..4];
         let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
@@ -599,8 +675,8 @@ mod tests {
 
     #[test]
     fn reject_truncated_at_sender_len() {
-        // 4 magic + 1 flags = 5, need 2 more for sender len.
-        let frame = &minimal_valid_frame()[..6];
+        // 4 magic + 4 flags = 8, need 4 more for sender len.
+        let frame = &minimal_valid_frame()[..9];
         let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
@@ -609,37 +685,37 @@ mod tests {
     fn reject_truncated_at_sender_data() {
         // Declare sender len = 18, but only provide 10 bytes.
         let full = minimal_valid_frame();
-        // sender_len field is at bytes 5..7, sender data starts at 7.
-        // Truncate mid-sender: 7 + 10 = 17 bytes.
-        let frame = &full[..17];
+        // sender_len field is at bytes 8..12, sender data starts at 12.
+        // Truncate mid-sender: 12 + 10 = 22 bytes.
+        let frame = &full[..22];
         let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
     #[test]
     fn reject_truncated_at_rcpt_count() {
-        // After sender (magic 4 + flags 1 + sender_len 2 + sender 18 = 25),
-        // need 2 bytes for rcpt_count.
+        // After sender (magic 4 + flags 4 + sender_len 4 + sender 18 = 30),
+        // need 4 bytes for rcpt_count.
         let full = minimal_valid_frame();
-        let frame = &full[..26];
+        let frame = &full[..32];
         let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
     #[test]
     fn reject_truncated_at_rcpt_len() {
-        // After rcpt_count (byte 27), need 2 bytes for rcpt[0] len.
+        // After rcpt_count (byte 34), need 4 bytes for rcpt[0] len.
         let full = minimal_valid_frame();
-        let frame = &full[..28];
+        let frame = &full[..36];
         let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
 
     #[test]
     fn reject_truncated_at_rcpt_data() {
-        // After rcpt_len (byte 29), need rcpt[0] data (16 bytes).
+        // After rcpt_len (byte 38), need rcpt[0] data (16 bytes).
         let full = minimal_valid_frame();
-        let frame = &full[..35]; // mid-recipient
+        let frame = &full[..45]; // mid-recipient
         let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
@@ -648,9 +724,9 @@ mod tests {
     fn reject_truncated_at_msg_len() {
         // After all recipients, need 8 bytes for message length.
         let full = minimal_valid_frame();
-        let total = full.len(); // 33 for "hello"
-                                // Everything except the last 5 bytes of msg data and 3 of msg_len.
-        let frame = &full[..total - 8]; // remove msg data + some of msg_len
+        let total = full.len(); // 67 for "hello"
+                                // Remove msg data + some of msg_len.
+        let frame = &full[..total - 8];
         let err = read_request(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
         assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
     }
@@ -669,20 +745,20 @@ mod tests {
     #[test]
     fn reject_address_over_limit_before_read() {
         let mut limits = permissive_limits();
-        limits.max_address_bytes = 10;
+        limits.max_address_bytes = 20; // sender (18 bytes) fits, recipient (34 bytes) does not
 
-        // Build a frame with a recipient declared as 20 bytes.
-        let sender = b"sender@example.com";
+        // Build a frame with a recipient declared as 34 bytes.
+        let sender = b"sender@example.com"; // 18 bytes, fits in limit
         let long_rcpt = b"very-long-rcpt-address@example.net"; // 34 bytes
         let msg = b"hi";
 
         let mut frame = Vec::new();
         frame.extend_from_slice(MAGIC);
-        frame.push(FLAGS_V0);
-        frame.extend_from_slice(&(sender.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes()); // flags u32
+        frame.extend_from_slice(&(sender.len() as u32).to_be_bytes());
         frame.extend_from_slice(sender);
-        frame.extend_from_slice(&1u16.to_be_bytes());
-        frame.extend_from_slice(&(long_rcpt.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&(long_rcpt.len() as u32).to_be_bytes());
         // Don't add the actual recipient data — the limit check happens
         // after reading the length, before reading the data.
         // But we do need the data in the frame for it not to be a
@@ -693,7 +769,56 @@ mod tests {
         frame.extend_from_slice(msg);
 
         let err = read_request(&mut Cursor::new(&frame), &limits).unwrap_err();
-        assert_eq!(err, SubmissionError::AddressTooLong { len: 34, limit: 10 });
+        assert_eq!(err, SubmissionError::AddressTooLong { len: 34, limit: 20 });
+    }
+
+    // ── sender limit checked before allocation ────────────────────────
+
+    #[test]
+    fn reject_sender_over_limit_before_read() {
+        let mut limits = permissive_limits();
+        limits.max_address_bytes = 5;
+
+        let sender = b"sender@example.com"; // 18 bytes, limit is 5
+        let rcpt = b"rcpt@example.net";
+        let msg = b"hi";
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.extend_from_slice(&0u32.to_be_bytes()); // flags u32
+        frame.extend_from_slice(&(sender.len() as u32).to_be_bytes());
+        frame.extend_from_slice(sender);
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&(rcpt.len() as u32).to_be_bytes());
+        frame.extend_from_slice(rcpt);
+        frame.extend_from_slice(&(msg.len() as u64).to_be_bytes());
+        frame.extend_from_slice(msg);
+
+        let err = read_request(&mut Cursor::new(&frame), &limits).unwrap_err();
+        assert_eq!(err, SubmissionError::AddressTooLong { len: 18, limit: 5 });
+    }
+
+    // ── u32::MAX adversarial for recipient count ──────────────────────
+
+    #[test]
+    fn reject_recipient_count_u32_max() {
+        let sender = b"a@b";
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC);
+        frame.extend_from_slice(&0u32.to_be_bytes()); // flags u32
+        frame.extend_from_slice(&(sender.len() as u32).to_be_bytes());
+        frame.extend_from_slice(sender);
+        frame.extend_from_slice(&u32::MAX.to_be_bytes()); // u32::MAX recipients
+
+        let err = read_request(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        assert_eq!(
+            err,
+            SubmissionError::TooManyRecipients {
+                count: u32::MAX as usize,
+                limit: permissive_limits().max_recipients
+            }
+        );
     }
 
     // ── response round-trips ──────────────────────────────────────────
@@ -771,10 +896,11 @@ mod tests {
     fn response_smtp_code_zero_is_none() {
         // Manually build a response frame with smtp_code = 0.
         let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC); // magic
         frame.push(STATUS_DELIVERED); // status
         frame.push(0); // not ambiguous
         frame.extend_from_slice(&0u16.to_be_bytes()); // smtp code = 0
-        frame.extend_from_slice(&5u16.to_be_bytes()); // diag len
+        frame.extend_from_slice(&5u32.to_be_bytes()); // diag len u32
         frame.extend_from_slice(b"hello"); // diagnostic
 
         let decoded = read_response(&mut Cursor::new(&frame), &permissive_limits()).unwrap();
@@ -811,11 +937,12 @@ mod tests {
     fn response_reject_invalid_utf8_diagnostic() {
         // Manually build a response with invalid UTF-8 in diagnostic.
         let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC); // magic
         frame.push(STATUS_DELIVERED);
         frame.push(0); // not ambiguous
         frame.extend_from_slice(&250u16.to_be_bytes());
         // Diagnostic: 3 bytes of invalid UTF-8.
-        frame.extend_from_slice(&3u16.to_be_bytes());
+        frame.extend_from_slice(&3u32.to_be_bytes());
         frame.extend_from_slice(&[0xFF, 0xFE, 0x80]); // invalid UTF-8
 
         let err = read_response(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
@@ -871,20 +998,13 @@ mod tests {
         limits.max_diagnostic_bytes = 10;
 
         // Build a response with a 20-byte diagnostic.
-        let mut frame = Vec::new();
-        frame.push(STATUS_DELIVERED);
-        frame.push(0);
-        frame.extend_from_slice(&250u16.to_be_bytes());
-        frame.extend_from_slice(&20u16.to_be_bytes()); // diag len = 20
-        frame.extend_from_slice(b"twenty bytes long!"); // actually 18, let's use 20
-
-        // Actually, let's build it properly.
-        let mut frame = Vec::new();
-        frame.push(STATUS_DELIVERED);
-        frame.push(0);
-        frame.extend_from_slice(&250u16.to_be_bytes());
         let diag: &[u8] = b"01234567890123456789"; // 20 bytes exactly
-        frame.extend_from_slice(&20u16.to_be_bytes());
+        let mut frame = Vec::new();
+        frame.extend_from_slice(MAGIC); // magic
+        frame.push(STATUS_DELIVERED);
+        frame.push(0);
+        frame.extend_from_slice(&250u16.to_be_bytes());
+        frame.extend_from_slice(&20u32.to_be_bytes()); // diag len u32 = 20
         frame.extend_from_slice(diag);
 
         let err = read_response(&mut Cursor::new(&frame), &limits).unwrap_err();
@@ -931,5 +1051,226 @@ mod tests {
             decoded.envelope.recipients()[0],
             b"rcpt@example.net".as_slice()
         );
+    }
+
+    // ── GOLDEN-BYTE: exact request layout (approved spec) ─────────────
+    // REQUEST = magic[4] SRL1; flags u32 BE; sender_len u32 BE; sender;
+    //           rcpt_count u32 BE; [rcpt_len u32 BE; rcpt]*; msg_len u64 BE; msg
+    #[test]
+    fn golden_request_exact_bytes() {
+        let sender = b"sender@example.com"; // 18 bytes
+        let rcpt = b"rcpt@example.net"; // 16 bytes
+        let msg = b"hello"; // 5 bytes
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"SRL1"); // magic
+        expected.extend_from_slice(&0u32.to_be_bytes()); // flags u32
+        expected.extend_from_slice(&18u32.to_be_bytes()); // sender_len u32
+        expected.extend_from_slice(sender);
+        expected.extend_from_slice(&1u32.to_be_bytes()); // rcpt_count u32
+        expected.extend_from_slice(&16u32.to_be_bytes()); // rcpt_len u32
+        expected.extend_from_slice(rcpt);
+        expected.extend_from_slice(&5u64.to_be_bytes()); // msg_len u64
+        expected.extend_from_slice(msg);
+        // Total: 4+4+4+18+4+4+16+8+5 = 67 bytes
+
+        assert_eq!(expected.len(), 67, "golden request should be 67 bytes");
+
+        // Write via codec
+        let envelope = Envelope::new(sender, vec![rcpt.to_vec()]).unwrap();
+        let req = SubmissionRequest {
+            envelope,
+            message: msg.to_vec(),
+        };
+        let mut written = Vec::new();
+        write_request(&mut written, &req).unwrap();
+
+        assert_eq!(
+            written, expected,
+            "write_request must produce exact spec bytes"
+        );
+        // read_request must also accept these exact bytes
+        let decoded = read_request(&mut Cursor::new(&expected), &permissive_limits()).unwrap();
+        assert_eq!(decoded.envelope.sender(), sender);
+    }
+
+    // ── GOLDEN-BYTE: exact response layout (approved spec) ────────────
+    // RESPONSE = magic[4] SRL1; status u8; flags u8 (bit0=ambiguous);
+    //            smtp_code u16 BE; diagnostic_len u32 BE; diagnostic UTF-8
+    #[test]
+    fn golden_response_exact_bytes() {
+        let diagnostic = "250 queued"; // 10 bytes
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"SRL1"); // magic
+        expected.push(0x00); // status: Delivered
+        expected.push(0x00); // flags: not ambiguous
+        expected.extend_from_slice(&250u16.to_be_bytes()); // smtp_code u16
+        expected.extend_from_slice(&10u32.to_be_bytes()); // diag_len u32
+        expected.extend_from_slice(diagnostic.as_bytes());
+        // Total: 4+1+1+2+4+10 = 22 bytes
+
+        assert_eq!(expected.len(), 22, "golden response should be 22 bytes");
+
+        // Write via codec
+        let result = DeliveryResult::delivered(diagnostic, Some(250));
+        let mut written = Vec::new();
+        write_response(&mut written, &result, 4096).unwrap();
+
+        assert_eq!(
+            written, expected,
+            "write_response must produce exact spec bytes"
+        );
+    }
+
+    // ── GOLDEN-BYTE: response with ambiguous flag ─────────────────────
+    #[test]
+    fn golden_response_ambiguous_exact_bytes() {
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"SRL1"); // magic
+        expected.push(0x01); // status: TemporaryFailure
+        expected.push(0x01); // flags: bit0=ambiguous
+        expected.extend_from_slice(&0u16.to_be_bytes()); // smtp_code: 0 → None
+        expected.extend_from_slice(&3u32.to_be_bytes()); // diag_len u32
+        expected.extend_from_slice(b"xxx");
+
+        let result = DeliveryResult::ambiguous("xxx");
+        let mut written = Vec::new();
+        write_response(&mut written, &result, 4096).unwrap();
+        assert_eq!(written, expected);
+    }
+
+    // ── response wrong magic rejected ─────────────────────────────────
+
+    #[test]
+    fn reject_response_wrong_magic() {
+        let mut frame = minimal_response_frame();
+        frame[0] = b'X'; // corrupt first magic byte
+
+        let err = read_response(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::InvalidMagic);
+    }
+
+    // ── response invalid status rejected ──────────────────────────────
+
+    #[test]
+    fn reject_response_invalid_status() {
+        let mut frame = minimal_response_frame();
+        frame[4] = 0xFF; // invalid status byte
+
+        let err = read_response(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::InvalidResponseStatus(0xFF));
+    }
+
+    // ── response unknown flags rejected ───────────────────────────────
+
+    #[test]
+    fn reject_response_unknown_flags() {
+        let mut frame = minimal_response_frame();
+        frame[5] = 0xFF; // flags byte: all bits set, unknown beyond bit0
+
+        let err = read_response(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::UnknownResponseFlags(0xFF));
+    }
+
+    #[test]
+    fn response_flag_bit1_rejected() {
+        let mut frame = minimal_response_frame();
+        frame[5] = 0x02; // only bit1 set (not ambiguous, but unknown)
+
+        let err = read_response(&mut Cursor::new(&frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::UnknownResponseFlags(0x02));
+    }
+
+    // ── response truncation at every byte boundary ────────────────────
+
+    #[test]
+    fn reject_response_truncation_at_every_field_boundary() {
+        let frame = minimal_response_frame();
+        for cut in 1..frame.len() {
+            let truncated = &frame[..cut];
+            let result = read_response(&mut Cursor::new(truncated), &permissive_limits());
+            assert!(
+                result.is_err(),
+                "response truncation at byte {} should fail, but got Ok",
+                cut
+            );
+            let err = result.unwrap_err();
+            assert!(
+                matches!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof)),
+                "response truncation at byte {}: expected Io(UnexpectedEof), got {:?}",
+                cut,
+                err
+            );
+        }
+    }
+
+    // ── response truncation at specific boundaries ────────────────────
+
+    #[test]
+    fn reject_response_truncated_at_magic() {
+        let frame = &minimal_response_frame()[..3];
+        let err = read_response(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_response_truncated_at_status() {
+        let frame = &minimal_response_frame()[..4];
+        let err = read_response(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_response_truncated_at_flags() {
+        let frame = &minimal_response_frame()[..5];
+        let err = read_response(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_response_truncated_at_smtp_code() {
+        // 4 magic + 1 status + 1 flags = 6, need 2 more for smtp_code
+        let frame = &minimal_response_frame()[..7];
+        let err = read_response(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_response_truncated_at_diag_len() {
+        // 4 + 1 + 1 + 2 = 8, need 4 more for diag_len u32
+        let frame = &minimal_response_frame()[..10];
+        let err = read_response(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    #[test]
+    fn reject_response_truncated_at_diag_data() {
+        let full = minimal_response_frame();
+        let frame = &full[..full.len() - 1];
+        let err = read_response(&mut Cursor::new(frame), &permissive_limits()).unwrap_err();
+        assert_eq!(err, SubmissionError::Io(io::ErrorKind::UnexpectedEof));
+    }
+
+    // ── write_response doesn't panic with max > u32 ───────────────────
+
+    #[test]
+    fn write_response_clamps_excessive_max_diagnostic() {
+        // Configured max > u32::MAX should not panic; clamped to 4096.
+        let result = DeliveryResult::delivered("ok", Some(250));
+        let mut encoded = Vec::new();
+        // This must not panic even with usize::MAX
+        write_response(&mut encoded, &result, usize::MAX).unwrap();
+
+        let decoded = read_response(&mut Cursor::new(&encoded), &permissive_limits()).unwrap();
+        assert_eq!(decoded.diagnostic, "ok");
+    }
+
+    // ── default max_message_bytes ─────────────────────────────────────
+
+    #[test]
+    fn default_max_message_bytes_is_26214400() {
+        let limits = SubmissionLimits::permissive();
+        assert_eq!(limits.max_message_bytes, 26_214_400);
     }
 }
