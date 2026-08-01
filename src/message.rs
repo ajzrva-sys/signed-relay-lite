@@ -163,12 +163,9 @@ impl Message {
             return Err(ParseError::HeaderBlockTooLarge);
         }
 
-        // Compute body hash from bytes[body_offset..] excluding terminal CRLF.
-        let body_data = if body_offset < bytes.len() - 2 {
-            &bytes[body_offset..bytes.len() - 2]
-        } else {
-            b""
-        };
+        // Hash the exact retained body representation, including its required
+        // terminal CRLF. Relaxed canonicalization handles trailing empty lines.
+        let body_data = &bytes[body_offset..];
         let mut canonicalizer = BodyCanonicalizer::default();
         canonicalizer.update(body_data);
         let body_hash = canonicalizer.finish();
@@ -201,13 +198,9 @@ impl Message {
         self.body_offset
     }
 
-    /// Body bytes (excluding terminal CRLF).
+    /// Exact retained body bytes, including the required terminal CRLF.
     pub fn body(&self) -> &[u8] {
-        if self.body_offset < self.bytes.len() - 2 {
-            &self.bytes[self.body_offset..self.bytes.len() - 2]
-        } else {
-            &[]
-        }
+        &self.bytes[self.body_offset..]
     }
 
     /// DKIM body hash.
@@ -390,7 +383,7 @@ mod tests {
         let mut msg = b"From: a@example.com\r\n\r\n".to_vec();
         msg.extend_from_slice(&[0xff, 0xfe, 0x80, b'\r', b'\n']);
         let message = Message::parse(msg, Limits::testing()).unwrap();
-        assert_eq!(message.body(), &[0xff, 0xfe, 0x80]);
+        assert_eq!(message.body(), &[0xff, 0xfe, 0x80, b'\r', b'\n']);
     }
 
     #[test]
@@ -401,9 +394,16 @@ mod tests {
     }
 
     #[test]
+    fn body_slice_includes_required_terminal_crlf() {
+        let bytes = b"From: a@example.com\r\n\r\nbody\r\n";
+        let message = Message::parse(bytes.to_vec(), Limits::testing()).unwrap();
+        assert_eq!(message.body(), b"body\r\n");
+    }
+
+    #[test]
     fn body_with_crlf_only() {
-        // Body is a single CRLF: headers + separator + \r\n + terminal CRLF.
-        let bytes = b"From: a@example.com\r\n\r\n\r\n\r\n";
+        // Body is a single CRLF following the header/body separator.
+        let bytes = b"From: a@example.com\r\n\r\n\r\n";
         let message = Message::parse(bytes.to_vec(), Limits::testing()).unwrap();
         assert_eq!(message.body(), b"\r\n");
     }
