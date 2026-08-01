@@ -324,6 +324,61 @@ pub type SmtpStream = Box<dyn ReadWrite + Send>;
 /// Maximum line length for SMTP reply parsing during delivery.
 const DELIVERY_MAX_LINE_LEN: usize = 4096;
 
+/// Tracks how far the SMTP transaction progressed.
+///
+/// Used to classify connection-loss failures: before the body is written
+/// the loss is **unambiguous** (nothing was committed); once body bytes
+/// have started flowing the loss is **ambiguous** (the server may or may
+/// not have accepted the message).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionPhase {
+    /// TCP connected, before SMTP dialog.
+    Connected,
+    /// EHLO accepted; envelope commands in progress.
+    Envelope,
+    /// `354` received; ready to send body.
+    DataAccepted,
+    /// Body bytes have been written (DKIM header and/or message data).
+    BodyStarted,
+    /// Terminating `.\\r\\n` sent; awaiting final server response.
+    FinalDotSent,
+    /// Final 2xx response received.
+    Complete,
+}
+
+impl TransactionPhase {
+    /// Returns `true` when the message body may have been partially
+    /// delivered, making a connection loss ambiguous.
+    fn is_ambiguous_on_close(self) -> bool {
+        matches!(self, Self::BodyStarted | Self::FinalDotSent)
+    }
+}
+
+/// Build a [`DeliveryResult`] for a non-2xx SMTP reply code.
+///
+/// `4xx` → [`TemporaryFailure`], `5xx` → [`PermanentFailure`].
+fn code_rejection(context: &str, code: u16) -> DeliveryResult {
+    if code >= 500 {
+        DeliveryResult::permanent_failure(format!("{context}: {code}"), Some(code))
+    } else {
+        DeliveryResult::temporary_failure(format!("{context}: {code}"), Some(code))
+    }
+}
+
+/// Classify a connection loss based on the current [`TransactionPhase`].
+///
+/// Before the body has started (`Connected`, `Envelope`, `DataAccepted`)
+/// the loss is **unambiguous** — nothing was committed.  Once body bytes
+/// have started flowing (`BodyStarted`, `FinalDotSent`) the loss is
+/// **ambiguous** — the server may or may not have accepted the message.
+fn connection_lost(phase: TransactionPhase) -> DeliveryResult {
+    if phase.is_ambiguous_on_close() {
+        DeliveryResult::ambiguous(format!("connection lost in {phase:?}"))
+    } else {
+        DeliveryResult::temporary_failure(format!("connection lost in {phase:?}"), None)
+    }
+}
+
 /// Deliver one signed message to a smarthost over a plaintext TCP
 /// connection.
 ///
@@ -355,137 +410,123 @@ pub fn deliver(
     let greeting = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
         Ok(r) => r,
         Err(e) => {
-            return DeliveryResult::temporary_failure(format!("greeting read error: {e:?}"), None);
+            return DeliveryResult::temporary_failure(format!("greeting: {e:?}"), None);
         }
     };
     if greeting.code != 220 {
-        return DeliveryResult::protocol_rejection(
-            format!("expected 220 greeting, got {}", greeting.code),
-            Some(greeting.code),
-        );
+        return code_rejection("greeting", greeting.code);
     }
 
     // 2. EHLO.
     if let Err(e) = writer.write_all(format!("EHLO {client_name}\r\n").as_bytes()) {
-        return DeliveryResult::temporary_failure(format!("EHLO write error: {e}"), None);
+        return DeliveryResult::temporary_failure(format!("EHLO write: {e}"), None);
     }
     let _ = writer.flush();
     let ehlo_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
         Ok(r) => r,
         Err(e) => {
-            return DeliveryResult::temporary_failure(format!("EHLO read error: {e:?}"), None);
+            return DeliveryResult::temporary_failure(format!("EHLO read: {e:?}"), None);
         }
     };
     if ehlo_reply.code != 250 {
-        return DeliveryResult::protocol_rejection(
-            format!("EHLO rejected: {}", ehlo_reply.code),
-            Some(ehlo_reply.code),
-        );
+        return code_rejection("EHLO", ehlo_reply.code);
     }
 
     // 3. MAIL FROM.
     if let Err(e) = write_mail_from(&mut writer, envelope) {
-        return DeliveryResult::temporary_failure(format!("MAIL FROM write error: {e}"), None);
+        return DeliveryResult::temporary_failure(format!("MAIL write: {e}"), None);
     }
     let _ = writer.flush();
     let mail_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
         Ok(r) => r,
         Err(e) => {
-            return DeliveryResult::temporary_failure(format!("MAIL FROM read error: {e:?}"), None);
+            return DeliveryResult::temporary_failure(format!("MAIL read: {e:?}"), None);
         }
     };
     if mail_reply.code != 250 {
-        return DeliveryResult::protocol_rejection(
-            format!("MAIL FROM rejected: {}", mail_reply.code),
-            Some(mail_reply.code),
-        );
+        return code_rejection("MAIL", mail_reply.code);
     }
 
-    // 4. RCPT TO — send all, then check all responses are 2xx.
+    // 4. RCPT TO — send all, then check responses.
     if let Err(e) = write_rcpt_to_list(&mut writer, envelope) {
-        return DeliveryResult::temporary_failure(format!("RCPT TO write error: {e}"), None);
+        return DeliveryResult::temporary_failure(format!("RCPT write: {e}"), None);
     }
     let _ = writer.flush();
-    let mut any_non_2xx = false;
-    let mut first_bad_code: u16 = 0;
+    let mut first_4xx: Option<u16> = None;
+    let mut first_5xx: Option<u16> = None;
     for _ in envelope.recipients() {
         let rcpt_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
             Ok(r) => r,
             Err(e) => {
-                return DeliveryResult::temporary_failure(
-                    format!("RCPT TO read error: {e:?}"),
-                    None,
-                );
+                return DeliveryResult::temporary_failure(format!("RCPT read: {e:?}"), None);
             }
         };
-        if rcpt_reply.code >= 300 {
-            any_non_2xx = true;
-            if first_bad_code == 0 {
-                first_bad_code = rcpt_reply.code;
-            }
+        if (400..500).contains(&rcpt_reply.code) && first_4xx.is_none() {
+            first_4xx = Some(rcpt_reply.code);
+        } else if rcpt_reply.code >= 500 && first_5xx.is_none() {
+            first_5xx = Some(rcpt_reply.code);
         }
     }
 
     // 5. On any non-2xx RCPT → RSET, no DATA.
-    if any_non_2xx {
+    //    4xx presence wins (temporary) even when 5xx also present.
+    if first_4xx.is_some() || first_5xx.is_some() {
         let _ = writer.write_all(b"RSET\r\n");
         let _ = writer.flush();
         let _ = read_reply(&mut reader, DELIVERY_MAX_LINE_LEN);
-        return DeliveryResult::protocol_rejection(
-            format!("recipient rejected: {first_bad_code}"),
-            Some(first_bad_code),
-        );
+        if let Some(code) = first_4xx {
+            return DeliveryResult::temporary_failure(format!("recipient: {code}"), Some(code));
+        }
+        let code = first_5xx.unwrap();
+        return DeliveryResult::permanent_failure(format!("recipient: {code}"), Some(code));
     }
 
     // 6. DATA — require 354.
     if let Err(e) = writer.write_all(b"DATA\r\n") {
-        return DeliveryResult::temporary_failure(format!("DATA write error: {e}"), None);
+        return DeliveryResult::temporary_failure(format!("DATA write: {e}"), None);
     }
     let _ = writer.flush();
     let data_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
         Ok(r) => r,
         Err(e) => {
-            return DeliveryResult::temporary_failure(format!("DATA read error: {e:?}"), None);
+            // Connection closed before 354 → temp, unambiguous.
+            return DeliveryResult::temporary_failure(format!("DATA: {e:?}"), None);
         }
     };
     if data_reply.code != 354 {
-        return DeliveryResult::protocol_rejection(
-            format!("DATA rejected: {}", data_reply.code),
-            Some(data_reply.code),
-        );
+        return code_rejection("DATA", data_reply.code);
     }
+    // At this point the server sent 354; we are about to write the body.
+    // Phase starts at BodyStarted because that is the first value read
+    // by connection_lost().
+    let mut phase = TransactionPhase::BodyStarted;
 
     // 7. Write DKIM-Signature header + dot-stuffed message.
     if writer.write_all(b"DKIM-Signature: ").is_err()
         || writer.write_all(dkim_signature).is_err()
         || writer.write_all(b"\r\n").is_err()
     {
-        return DeliveryResult::temporary_failure("DKIM header write error", None);
+        return connection_lost(phase);
     }
-    if let Err(e) = write_data(&mut writer, message) {
-        return DeliveryResult::temporary_failure(format!("body write error: {e}"), None);
+    if write_data(&mut writer, message).is_err() {
+        return connection_lost(phase);
     }
     let _ = writer.flush();
+    phase = TransactionPhase::FinalDotSent;
 
     // 8. Read final response — Delivered only after 2xx.
     let final_reply = match read_reply(&mut reader, DELIVERY_MAX_LINE_LEN) {
         Ok(r) => r,
-        Err(e) => {
-            return DeliveryResult::ambiguous(format!("final response read error: {e:?}"));
+        Err(_) => {
+            // After final dot, connection loss is ambiguous.
+            return connection_lost(phase);
         }
     };
     if (200..300).contains(&final_reply.code) {
-        let diag = final_reply
-            .lines
-            .first()
-            .map(|l| String::from_utf8_lossy(l).to_string())
-            .unwrap_or_default();
-        DeliveryResult::delivered(diag, Some(final_reply.code))
+        DeliveryResult::delivered(String::new(), Some(final_reply.code))
     } else {
-        DeliveryResult::protocol_rejection(
-            format!("final response: {}", final_reply.code),
-            Some(final_reply.code),
-        )
+        // Final 4xx → temp unambiguous; final 5xx → permanent.
+        code_rejection("final", final_reply.code)
     }
 }
 

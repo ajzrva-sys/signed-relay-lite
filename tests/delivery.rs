@@ -9,8 +9,8 @@ mod common;
 use std::net::TcpStream;
 use std::time::Duration;
 
-use common::{FakeSmarthost, ServerResult, SmarthostConfig};
-use signed_relay_lite::relay::{DeliveryResult, Envelope};
+use common::{ClosePoint, FakeSmarthost, ServerResult, SmarthostConfig};
+use signed_relay_lite::relay::{DeliveryResult, DeliveryStatus, Envelope};
 use signed_relay_lite::smtp::deliver;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -277,4 +277,269 @@ fn non_utf8_bytes_preserved() {
     expected.extend_from_slice(&message);
 
     assert_eq!(sr.captured_message, expected);
+}
+
+// ── Task 14: Explicit failure classification ────────────────────────
+
+/// Greeting 4xx → TemporaryFailure, not ambiguous.
+#[test]
+fn greeting_4xx_is_temporary() {
+    let config = SmarthostConfig {
+        greeting: b"421 service unavailable\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, _sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(!result.ambiguous);
+    assert_eq!(result.smtp_code, Some(421));
+}
+
+/// Greeting 5xx → PermanentFailure, not ambiguous.
+#[test]
+fn greeting_5xx_is_permanent() {
+    let config = SmarthostConfig {
+        greeting: b"554 banned\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, _sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::PermanentFailure);
+    assert!(!result.ambiguous);
+    assert_eq!(result.smtp_code, Some(554));
+}
+
+/// MAIL FROM 4xx → TemporaryFailure.
+#[test]
+fn mail_from_4xx_is_temporary() {
+    let config = SmarthostConfig {
+        mail_from_response: b"452 insufficient system storage\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, _sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(!result.ambiguous);
+    assert_eq!(result.smtp_code, Some(452));
+}
+
+/// MAIL FROM 5xx → PermanentFailure.
+#[test]
+fn mail_from_5xx_is_permanent() {
+    let config = SmarthostConfig {
+        mail_from_response: b"550 sender rejected\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, _sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::PermanentFailure);
+    assert!(!result.ambiguous);
+    assert_eq!(result.smtp_code, Some(550));
+}
+
+/// Any RCPT 4xx → TemporaryFailure, RSET, no DATA.
+#[test]
+fn rcpt_4xx_is_temporary_no_data() {
+    let config = SmarthostConfig {
+        rcpt_responses: vec![b"452 mailbox full\r\n".to_vec()],
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(!result.ambiguous);
+    assert_eq!(result.smtp_code, Some(452));
+    assert!(sr.commands.iter().any(|c| c.starts_with(b"RSET")));
+    assert!(!sr.commands.iter().any(|c| c.starts_with(b"DATA")));
+}
+
+/// RCPT 5xx with no 4xx → PermanentFailure, RSET, no DATA.
+#[test]
+fn rcpt_5xx_only_is_permanent_no_data() {
+    let config = SmarthostConfig {
+        rcpt_responses: vec![b"550 user unknown\r\n".to_vec()],
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::PermanentFailure);
+    assert!(!result.ambiguous);
+    assert_eq!(result.smtp_code, Some(550));
+    assert!(sr.commands.iter().any(|c| c.starts_with(b"RSET")));
+    assert!(!sr.commands.iter().any(|c| c.starts_with(b"DATA")));
+}
+
+/// Mixed RCPT (4xx + 5xx) → TemporaryFailure (4xx presence wins).
+#[test]
+fn mixed_rcpt_4xx_and_5xx_is_temporary() {
+    let config = SmarthostConfig {
+        rcpt_responses: vec![
+            b"452 mailbox full\r\n".to_vec(),
+            b"550 user unknown\r\n".to_vec(),
+        ],
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope = Envelope::new(
+        b"sender@example.com",
+        vec![b"full@example.com".to_vec(), b"bad@example.com".to_vec()],
+    )
+    .unwrap();
+
+    let (result, sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(!result.ambiguous);
+    assert_eq!(result.smtp_code, Some(452));
+    assert!(!sr.commands.iter().any(|c| c.starts_with(b"DATA")));
+}
+
+/// Connection closes before 354/body → TemporaryFailure, unambiguous.
+#[test]
+fn close_before_354_is_temporary_unambiguous() {
+    let config = SmarthostConfig {
+        close_point: ClosePoint::BeforeData,
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, _sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(!result.ambiguous, "before 354 must be unambiguous");
+    assert_eq!(result.smtp_code, None);
+}
+
+/// Connection closes during body → TemporaryFailure, ambiguous.
+#[test]
+fn close_during_body_is_temporary_ambiguous() {
+    let config = SmarthostConfig {
+        close_point: ClosePoint::DuringData,
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, _sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(result.ambiguous, "during body must be ambiguous");
+}
+
+/// Connection closes after final dot before reply → TemporaryFailure, ambiguous.
+#[test]
+fn close_after_final_dot_is_temporary_ambiguous() {
+    let config = SmarthostConfig {
+        close_point: ClosePoint::AfterFinalDot,
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, _sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(result.ambiguous, "after final dot must be ambiguous");
+}
+
+/// Final 4xx → TemporaryFailure, not ambiguous (reply exists).
+#[test]
+fn final_4xx_is_temporary_unambiguous() {
+    let config = SmarthostConfig {
+        data_final_response: b"452 insufficient storage\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, _sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(!result.ambiguous, "final 4xx is not ambiguous");
+    assert_eq!(result.smtp_code, Some(452));
+}
+
+/// Final 5xx → PermanentFailure.
+#[test]
+fn final_5xx_is_permanent() {
+    let config = SmarthostConfig {
+        data_final_response: b"550 message rejected\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, _sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::PermanentFailure);
+    assert!(!result.ambiguous);
+    assert_eq!(result.smtp_code, Some(550));
+}
+
+/// DATA 4xx → TemporaryFailure, no body sent.
+#[test]
+fn data_4xx_is_temporary() {
+    let config = SmarthostConfig {
+        data_go_ahead: b"451 temp error\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::TemporaryFailure);
+    assert!(!result.ambiguous);
+    assert_eq!(result.smtp_code, Some(451));
+    assert!(sr.captured_message.is_empty());
+}
+
+/// DATA 5xx → PermanentFailure, no body sent.
+#[test]
+fn data_5xx_is_permanent() {
+    let config = SmarthostConfig {
+        data_go_ahead: b"550 policy violation\r\n".to_vec(),
+        ..SmarthostConfig::default()
+    };
+    let server = FakeSmarthost::start(config);
+    let envelope =
+        Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+
+    let (result, sr) = run_delivery(server, "test-client", &envelope, b"sig", b"msg\r\n");
+
+    assert_eq!(result.status, DeliveryStatus::PermanentFailure);
+    assert!(!result.ambiguous);
+    assert_eq!(result.smtp_code, Some(550));
+    assert!(sr.captured_message.is_empty());
 }

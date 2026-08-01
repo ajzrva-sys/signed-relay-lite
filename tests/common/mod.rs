@@ -224,11 +224,11 @@ fn run_server(stream: TcpStream, config: &SmarthostConfig) -> ServerResult {
             writer.flush().unwrap();
             rcpt_idx += 1;
         } else if line.starts_with(b"DATA") {
-            writer.write_all(&config.data_go_ahead).unwrap();
-            writer.flush().unwrap();
             if config.close_point == ClosePoint::BeforeData {
                 break;
             }
+            writer.write_all(&config.data_go_ahead).unwrap();
+            writer.flush().unwrap();
             in_data = true;
         } else if line.starts_with(b"RSET") {
             writer.write_all(b"250 OK\r\n").unwrap();
