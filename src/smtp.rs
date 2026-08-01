@@ -23,7 +23,9 @@
 //!   single reply, preventing an infinite continuation sequence from
 //!   growing the result `Vec` without bound.
 
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
+
+use crate::relay::Envelope;
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -220,6 +222,83 @@ fn drain_until_crlf(reader: &mut impl BufRead) -> Result<(), SmtpError> {
     }
 }
 
+// ── SMTP command encoding ─────────────────────────────────────────────
+
+/// Write a `MAIL FROM:<sender>\r\n` command to `w`.
+///
+/// Because `envelope` was constructed via [`Envelope::new`], the sender
+/// is guaranteed to contain only printable ASCII bytes with no CR, LF,
+/// `<`, `>`, or spaces — making command injection impossible.
+pub fn write_mail_from(w: &mut impl Write, envelope: &Envelope) -> io::Result<()> {
+    w.write_all(b"MAIL FROM:<")?;
+    w.write_all(envelope.sender())?;
+    w.write_all(b">\r\n")
+}
+
+/// Write one `RCPT TO:<addr>\r\n` command per recipient to `w`.
+///
+/// Same injection safety guarantees as [`write_mail_from`].
+pub fn write_rcpt_to_list(w: &mut impl Write, envelope: &Envelope) -> io::Result<()> {
+    for rcpt in envelope.recipients() {
+        w.write_all(b"RCPT TO:<")?;
+        w.write_all(rcpt)?;
+        w.write_all(b">\r\n")?;
+    }
+    Ok(())
+}
+
+// ── DATA dot transparency ─────────────────────────────────────────────
+
+/// Stream dot-stuffed message data followed by the terminating `.\r\n`.
+///
+/// RFC 5321 §4.5.2 requires that any line in the message data beginning
+/// with `.` has an additional `.` prepended (dot-stuffing).  The
+/// transmission ends with a line containing only `.\r\n`.
+///
+/// This writer scans for dots at line-start positions and writes
+/// contiguous spans between them, avoiding a second full-message
+/// allocation.
+///
+/// # Canonical input assumption
+///
+/// Retained messages end with `\r\n` (canonical CRLF form).  The
+/// function adds exactly `.\r\n` after the (possibly stuffed) message
+/// bytes.  If the input lacks a trailing `\r\n`, the terminator still
+/// follows immediately — the caller is responsible for ensuring
+/// canonical framing before calling this function.
+pub fn write_data(w: &mut impl Write, message: &[u8]) -> io::Result<()> {
+    let mut last = 0; // start of the current unwritten span
+
+    for i in 0..message.len() {
+        if message[i] == b'.' {
+            let is_line_start =
+                i == 0 || (i >= 2 && message[i - 2] == b'\r' && message[i - 1] == b'\n');
+            if is_line_start {
+                // Flush the span up to and including this dot.
+                w.write_all(&message[last..=i])?;
+                // Write the extra dot (dot-stuffing).
+                w.write_all(b".")?;
+                last = i + 1;
+            }
+        }
+    }
+
+    // Flush remaining bytes.
+    w.write_all(&message[last..])?;
+    // Terminating dot-line.
+    w.write_all(b".\r\n")
+}
+
+/// Convenience wrapper: dot-stuff `message` into a new `Vec<u8>`.
+///
+/// Delegates to [`write_data`].
+pub fn encode_data(message: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // Infallible: Vec writes never fail.
+    write_data(&mut buf, message).expect("Vec::write_all is infallible");
+    buf
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -399,5 +478,118 @@ mod tests {
         let reply = read_reply(&mut reader(&data), 4096).unwrap();
         assert_eq!(reply.code, 250);
         assert_eq!(reply.lines.len(), MAX_REPLY_LINES);
+    }
+
+    // ── encode_data: dot transparency ───────────────────────────────
+
+    #[test]
+    fn dot_stuffs_only_at_line_start() {
+        let message = b"Header: x\r\n\r\n.one\r\ntwo.three\r\n..four\r\n";
+        assert_eq!(
+            encode_data(message),
+            b"Header: x\r\n\r\n..one\r\ntwo.three\r\n...four\r\n.\r\n"
+        );
+    }
+
+    #[test]
+    fn dot_at_first_byte() {
+        // Single dot as first byte of message → stuff it.
+        assert_eq!(encode_data(b".hello\r\n"), b"..hello\r\n.\r\n");
+    }
+
+    #[test]
+    fn consecutive_leading_dots() {
+        // Multiple consecutive lines each starting with a dot → each stuffed.
+        assert_eq!(encode_data(b".one\r\n.two\r\n"), b"..one\r\n..two\r\n.\r\n");
+    }
+
+    #[test]
+    fn dot_in_middle_unchanged() {
+        // Dot in the middle of a line must not be stuffed.
+        assert_eq!(encode_data(b"hello.world\r\n"), b"hello.world\r\n.\r\n");
+    }
+
+    #[test]
+    fn no_dots_passthrough() {
+        assert_eq!(encode_data(b"plain line\r\n"), b"plain line\r\n.\r\n");
+    }
+
+    #[test]
+    fn canonical_empty_body() {
+        // Empty body = just the terminating dot.
+        assert_eq!(encode_data(b""), b".\r\n");
+    }
+
+    #[test]
+    fn dot_stuffing_streaming_to_writer() {
+        // Verify streaming write_data works via a short-write writer.
+        let message = b".line1\r\nline2\r\n..line3\r\n";
+        let mut buf = Vec::new();
+        write_data(&mut buf, message).unwrap();
+        assert_eq!(buf, b"..line1\r\nline2\r\n...line3\r\n.\r\n");
+    }
+
+    #[test]
+    fn write_data_io_error_propagation() {
+        // A writer that always fails: write_data must propagate, not panic.
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "fail"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let result = write_data(&mut FailingWriter, b".x\r\n");
+        assert!(result.is_err());
+    }
+
+    // ── MAIL FROM / RCPT TO command encoding ───────────────────────
+
+    #[test]
+    fn mail_from_normal_sender() {
+        let env = Envelope::new(b"sender@example.com", vec![b"rcpt@example.com".to_vec()]).unwrap();
+        let mut buf = Vec::new();
+        write_mail_from(&mut buf, &env).unwrap();
+        assert_eq!(buf, b"MAIL FROM:<sender@example.com>\r\n");
+    }
+
+    #[test]
+    fn mail_from_empty_reverse_path() {
+        let env = Envelope::new(b"", vec![b"rcpt@example.com".to_vec()]).unwrap();
+        let mut buf = Vec::new();
+        write_mail_from(&mut buf, &env).unwrap();
+        assert_eq!(buf, b"MAIL FROM:<>\r\n");
+    }
+
+    #[test]
+    fn rcpt_to_normal_recipient() {
+        let env = Envelope::new(
+            b"sender@example.com",
+            vec![b"a@example.com".to_vec(), b"b@example.com".to_vec()],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        write_rcpt_to_list(&mut buf, &env).unwrap();
+        assert_eq!(
+            buf,
+            b"RCPT TO:<a@example.com>\r\nRCPT TO:<b@example.com>\r\n"
+        );
+    }
+
+    #[test]
+    fn injection_blocked_by_envelope_validation() {
+        // Envelope::new rejects CR/LF, so injection is impossible.
+        assert!(Envelope::new(
+            b"bad\r\nInjected: header",
+            vec![b"rcpt@example.com".to_vec()]
+        )
+        .is_err());
+        assert!(Envelope::new(
+            b"sender@example.com",
+            vec![b"bad\r\nRCPT TO:injected".to_vec()]
+        )
+        .is_err());
     }
 }
