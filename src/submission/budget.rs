@@ -11,7 +11,38 @@ use std::sync::{Arc, Mutex};
 /// reservation; cloning would cause a double-release.
 pub struct MemoryReservation {
     inner: Arc<Mutex<usize>>,
+    capacity: usize,
     bytes: usize,
+}
+
+impl MemoryReservation {
+    /// Atomically add `additional` bytes to this reservation.
+    ///
+    /// Checked arithmetic and the capacity check happen while holding the
+    /// budget mutex. On failure, neither this guard nor global usage changes.
+    pub fn try_grow(&mut self, additional: usize) -> bool {
+        let mut used = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(new_used) = used.checked_add(additional) else {
+            return false;
+        };
+        let Some(new_bytes) = self.bytes.checked_add(additional) else {
+            return false;
+        };
+        if new_used > self.capacity {
+            return false;
+        }
+        *used = new_used;
+        self.bytes = new_bytes;
+        true
+    }
+
+    /// Cumulative bytes currently owned by this guard.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 impl std::fmt::Debug for MemoryReservation {
@@ -69,6 +100,7 @@ impl MemoryBudget {
         *used = new_total;
         Some(MemoryReservation {
             inner: Arc::clone(&self.inner),
+            capacity: self.capacity,
             bytes,
         })
     }
@@ -212,6 +244,83 @@ mod tests {
 
     fn move_reservation(r: MemoryReservation) -> MemoryReservation {
         r // move, not copy
+    }
+
+    #[test]
+    fn reservation_grows_with_retained_bytes() {
+        let budget = MemoryBudget::new(100);
+        let mut reservation = budget.try_reserve(0).unwrap();
+
+        assert!(reservation.try_grow(40));
+        assert!(reservation.try_grow(35));
+        assert_eq!(reservation.bytes(), 75);
+        assert_eq!(budget.used(), 75);
+    }
+
+    #[test]
+    fn failed_growth_does_not_change_used_bytes() {
+        let budget = MemoryBudget::new(100);
+        let mut reservation = budget.try_reserve(20).unwrap();
+
+        assert!(!reservation.try_grow(81));
+        assert_eq!(reservation.bytes(), 20);
+        assert_eq!(budget.used(), 20);
+    }
+
+    #[test]
+    fn checked_growth_overflow_is_rejected() {
+        let budget = MemoryBudget::new(usize::MAX);
+        let mut reservation = budget.try_reserve(usize::MAX).unwrap();
+
+        assert!(!reservation.try_grow(1));
+        assert_eq!(reservation.bytes(), usize::MAX);
+        assert_eq!(budget.used(), usize::MAX);
+    }
+
+    #[test]
+    fn dropping_grown_reservation_releases_exact_total_once() {
+        let budget = MemoryBudget::new(100);
+        let mut reservation = budget.try_reserve(10).unwrap();
+        assert!(reservation.try_grow(20));
+        assert!(reservation.try_grow(30));
+        assert_eq!(budget.used(), 60);
+
+        let moved = move_reservation(reservation);
+        assert_eq!(budget.used(), 60);
+        drop(moved);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn two_streams_cannot_grow_past_global_budget() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let budget = MemoryBudget::new(100);
+        let ready = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let budget = budget.clone();
+                let ready = Arc::clone(&ready);
+                let release = Arc::clone(&release);
+                thread::spawn(move || {
+                    let mut reservation = budget.try_reserve(0).unwrap();
+                    let grew = reservation.try_grow(60);
+                    ready.wait();
+                    release.wait();
+                    (grew, reservation.bytes())
+                })
+            })
+            .collect();
+
+        ready.wait();
+        assert_eq!(budget.used(), 60, "successful growth must remain live");
+        release.wait();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|(grew, _)| *grew).count(), 1);
+        assert_eq!(results.iter().map(|(_, bytes)| *bytes).sum::<usize>(), 60);
+        assert_eq!(budget.used(), 0);
     }
 
     // ── Budget integration into read_request ─────────────────────────

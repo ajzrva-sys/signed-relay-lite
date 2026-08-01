@@ -22,8 +22,8 @@ use signed_relay_lite::relay::{
 };
 use signed_relay_lite::smtp::{read_reply, SmtpConnection, SmtpError, SmtpStream};
 use signed_relay_lite::submission::{
-    read_request, read_response, write_response, MemoryBudget, SubmissionError, SubmissionLimits,
-    SubmissionServer,
+    read_chunk_stream, read_request, read_response, write_response, MemoryBudget, SubmissionError,
+    SubmissionLimits, SubmissionServer,
 };
 
 const DEADLINE: Duration = Duration::from_secs(2);
@@ -58,14 +58,41 @@ fn request_frame(recipients: usize, message_len: u64, body: &[u8]) -> Vec<u8> {
 
 #[test]
 fn server_rejects_cumulative_chunk_length_above_advertised_limit() {
-    let mut bytes = request_frame(1, 64, &[b'x'; 64]);
-    bytes.push(b'x');
-    let mut reader = Cursor::new(bytes);
-    let result = read_request(&mut reader, &limits(), &MemoryBudget::new(64));
+    let mut wire = Vec::new();
+    wire.extend(32_u32.to_be_bytes());
+    wire.extend([b'x'; 32]);
+    wire.extend(33_u32.to_be_bytes());
+    wire.extend([b'y'; 33]);
+    let mut reader = Cursor::new(wire);
+    let budget = MemoryBudget::new(64);
+    let result = read_chunk_stream(&mut reader, 64, 64, &budget);
     assert_eq!(
         result.unwrap_err(),
         SubmissionError::MessageTooLarge { len: 65, limit: 64 }
     );
+    assert_eq!(reader.position(), 40, "second payload must not be read");
+    assert_eq!(budget.used(), 0, "retained first chunk must be released");
+}
+
+#[test]
+fn returned_chunk_payload_owns_its_cumulative_reservation() {
+    let mut wire = Vec::new();
+    wire.extend(3_u32.to_be_bytes());
+    wire.extend(b"abc");
+    wire.extend(2_u32.to_be_bytes());
+    wire.extend(b"de");
+    wire.extend(0_u32.to_be_bytes());
+    let budget = MemoryBudget::new(5);
+
+    let retained = read_chunk_stream(&mut Cursor::new(wire), 5, 3, &budget).unwrap();
+    assert_eq!(retained.bytes(), b"abcde");
+    assert_eq!(retained.reserved_bytes(), 5);
+    assert_eq!(budget.used(), 5);
+    let (bytes, reservation) = retained.into_parts();
+    assert_eq!(bytes, b"abcde");
+    assert_eq!(budget.used(), 5, "moving parts must preserve accounting");
+    drop(reservation);
+    assert_eq!(budget.used(), 0);
 }
 
 struct CountingReader {

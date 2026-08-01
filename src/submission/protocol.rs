@@ -66,7 +66,6 @@ pub const MAX_ADDRESS_BYTES: usize = 254;
 /// Maximum bytes in a delivery diagnostic.
 pub const MAX_DIAGNOSTIC_BYTES: usize = 4096;
 /// Maximum bytes in one SRL2 message chunk.
-#[allow(dead_code)] // Used when the SRL2 stream codec lands.
 pub const MAX_CHUNK_BYTES: usize = 64 * 1024;
 
 impl Envelope {
@@ -131,6 +130,8 @@ pub enum SubmissionError {
     AddressTooLong { len: usize, limit: usize },
     /// Declared message length exceeds the configured limit.
     MessageTooLarge { len: u64, limit: u64 },
+    /// A streamed chunk exceeds the fixed or advertised chunk limit.
+    ChunkTooLarge { len: usize, limit: usize },
     /// Diagnostic string exceeds the configured limit.
     DiagnosticTooLong { len: usize, limit: usize },
     /// Diagnostic bytes are not valid UTF-8.
@@ -142,6 +143,18 @@ pub enum SubmissionError {
     Envelope(EnvelopeError),
     /// The global memory budget cannot accommodate the declared message size.
     BudgetExhausted { requested: usize, capacity: usize },
+}
+
+impl SubmissionError {
+    /// Whether a pre-delivery failure should invite a later retry.
+    pub fn is_temporary(&self) -> bool {
+        matches!(self, Self::BudgetExhausted { .. })
+    }
+
+    /// Pre-delivery codec failures occur before relay delivery can be attempted.
+    pub fn is_ambiguous(&self) -> bool {
+        false
+    }
 }
 
 // ── SRL2 frames ──────────────────────────────────────────────────────
@@ -198,6 +211,30 @@ pub struct SubmissionRequest {
     /// is the `Drop` impl that returns bytes to the budget.
     #[allow(dead_code)]
     reservation: MemoryReservation,
+}
+
+/// Bytes decoded from an SRL2 chunk stream together with their budget owner.
+#[derive(Debug)]
+pub struct RetainedMessage {
+    bytes: Vec<u8>,
+    reservation: MemoryReservation,
+}
+
+impl RetainedMessage {
+    /// Borrow the retained message bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Bytes charged to the global retained-message budget.
+    pub fn reserved_bytes(&self) -> usize {
+        self.reservation.bytes()
+    }
+
+    /// Take ownership while preserving the reservation guard.
+    pub fn into_parts(self) -> (Vec<u8>, MemoryReservation) {
+        (self.bytes, self.reservation)
+    }
 }
 
 impl SubmissionRequest {
@@ -461,6 +498,106 @@ pub fn read_final_result<R: Read>(r: &mut R) -> Result<DeliveryResult, Submissio
         ServerReply::Final(result) => Ok(result),
         ServerReply::Ready(_) => Err(SubmissionError::UnknownServerReplyKind(READY_KIND)),
     }
+}
+
+// ── SRL2 chunk stream ────────────────────────────────────────────────
+
+/// Decode one terminated SRL2 message chunk stream.
+///
+/// Each chunk is `[length: u32 BE][payload]`; a zero length terminates the
+/// stream. The length is checked against both the advertised chunk maximum
+/// and [`MAX_CHUNK_BYTES`] before any payload allocation or read. Retained
+/// bytes are charged incrementally before being appended and the returned
+/// value keeps that reservation alive.
+///
+/// The fixed [`MAX_CHUNK_BYTES`] scratch buffer is temporary handler memory,
+/// separate from retained-message accounting. A daemon therefore bounds this
+/// temporary memory as `MAX_CHUNK_BYTES * max_concurrent_submissions`.
+pub fn read_chunk_stream<R: Read>(
+    r: &mut R,
+    max_message_bytes: u64,
+    max_chunk_bytes: u32,
+    budget: &MemoryBudget,
+) -> Result<RetainedMessage, SubmissionError> {
+    let effective_chunk_max = usize::try_from(max_chunk_bytes)
+        .unwrap_or(usize::MAX)
+        .min(MAX_CHUNK_BYTES);
+    let mut bytes = Vec::new();
+    let mut reservation = budget
+        .try_reserve(0)
+        .expect("a zero-byte reservation must always fit");
+    let mut scratch = [0_u8; MAX_CHUNK_BYTES];
+    let mut cumulative = 0_u64;
+
+    loop {
+        let chunk_len_raw = read_u32(r)?;
+        if chunk_len_raw == 0 {
+            return Ok(RetainedMessage { bytes, reservation });
+        }
+        let chunk_len =
+            usize::try_from(chunk_len_raw).map_err(|_| SubmissionError::ChunkTooLarge {
+                len: chunk_len_raw as usize,
+                limit: effective_chunk_max,
+            })?;
+        if chunk_len > effective_chunk_max {
+            return Err(SubmissionError::ChunkTooLarge {
+                len: chunk_len,
+                limit: effective_chunk_max,
+            });
+        }
+
+        cumulative = cumulative.checked_add(u64::from(chunk_len_raw)).ok_or(
+            SubmissionError::MessageTooLarge {
+                len: u64::MAX,
+                limit: max_message_bytes,
+            },
+        )?;
+        if cumulative > max_message_bytes {
+            return Err(SubmissionError::MessageTooLarge {
+                len: cumulative,
+                limit: max_message_bytes,
+            });
+        }
+        let cumulative_usize =
+            usize::try_from(cumulative).map_err(|_| SubmissionError::MessageTooLarge {
+                len: cumulative,
+                limit: max_message_bytes,
+            })?;
+        if !reservation.try_grow(chunk_len) {
+            return Err(SubmissionError::BudgetExhausted {
+                requested: cumulative_usize,
+                capacity: budget.capacity(),
+            });
+        }
+
+        r.read_exact(&mut scratch[..chunk_len])?;
+        bytes.extend_from_slice(&scratch[..chunk_len]);
+    }
+}
+
+/// Encode bytes as a terminated SRL2 message chunk stream.
+pub fn write_chunk_stream<W: Write>(
+    w: &mut W,
+    bytes: &[u8],
+    max_chunk_bytes: u32,
+) -> Result<(), io::Error> {
+    let chunk_max = usize::try_from(max_chunk_bytes)
+        .unwrap_or(usize::MAX)
+        .min(MAX_CHUNK_BYTES);
+    if chunk_max == 0 && !bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "non-empty chunk stream requires a positive chunk maximum",
+        ));
+    }
+    for chunk in bytes.chunks(chunk_max.max(1)) {
+        write_u32(
+            w,
+            u32::try_from(chunk.len()).expect("bounded chunk exceeds u32"),
+        )?;
+        w.write_all(chunk)?;
+    }
+    write_u32(w, 0)
 }
 
 // ── Request codec ─────────────────────────────────────────────────────
@@ -2010,5 +2147,132 @@ mod tests {
                 limit: MAX_ADDRESS_BYTES,
             }
         );
+    }
+
+    fn chunk_wire(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for chunk in chunks {
+            wire.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+            wire.extend_from_slice(chunk);
+        }
+        wire.extend_from_slice(&0_u32.to_be_bytes());
+        wire
+    }
+
+    #[test]
+    fn chunk_stream_immediate_zero_terminator() {
+        let budget = MemoryBudget::new(1);
+        let retained =
+            read_chunk_stream(&mut Cursor::new(0_u32.to_be_bytes()), 1, 1, &budget).unwrap();
+        assert!(retained.bytes().is_empty());
+        assert_eq!(retained.reserved_bytes(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn chunk_stream_exact_max_chunk_and_writer_round_trip() {
+        let body = vec![b'x'; MAX_CHUNK_BYTES];
+        let mut wire = Vec::new();
+        write_chunk_stream(&mut wire, &body, MAX_CHUNK_BYTES as u32).unwrap();
+        let budget = MemoryBudget::new(body.len());
+        let retained = read_chunk_stream(
+            &mut Cursor::new(wire),
+            body.len() as u64,
+            MAX_CHUNK_BYTES as u32,
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(retained.bytes(), body);
+        assert_eq!(budget.used(), MAX_CHUNK_BYTES);
+    }
+
+    #[test]
+    fn chunk_stream_one_over_chunk_max_rejected_before_payload_read() {
+        let mut wire = ((MAX_CHUNK_BYTES + 1) as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(b"must-not-be-read");
+        let mut reader = Cursor::new(wire);
+        let budget = MemoryBudget::new(usize::MAX);
+        assert_eq!(
+            read_chunk_stream(&mut reader, u64::MAX, MAX_CHUNK_BYTES as u32, &budget).unwrap_err(),
+            SubmissionError::ChunkTooLarge {
+                len: MAX_CHUNK_BYTES + 1,
+                limit: MAX_CHUNK_BYTES
+            }
+        );
+        assert_eq!(reader.position(), 4);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn chunk_stream_cumulative_exact_message_max() {
+        let wire = chunk_wire(&[b"abc", b"def"]);
+        let budget = MemoryBudget::new(6);
+        let retained = read_chunk_stream(&mut Cursor::new(wire), 6, 3, &budget).unwrap();
+        assert_eq!(retained.bytes(), b"abcdef");
+        assert_eq!(retained.reserved_bytes(), 6);
+    }
+
+    #[test]
+    fn chunk_stream_cumulative_max_plus_one_uses_checked_arithmetic() {
+        let mut wire = chunk_wire(&[b"abcd"]);
+        wire.truncate(wire.len() - 4);
+        wire.extend_from_slice(&1_u32.to_be_bytes());
+        wire.push(b'e');
+        let mut reader = Cursor::new(wire);
+        let budget = MemoryBudget::new(5);
+        assert_eq!(
+            read_chunk_stream(&mut reader, 4, 4, &budget).unwrap_err(),
+            SubmissionError::MessageTooLarge { len: 5, limit: 4 }
+        );
+        assert_eq!(reader.position(), 4 + 4 + 4);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn truncated_chunk_payload_releases_all_reservation() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&3_u32.to_be_bytes());
+        wire.extend_from_slice(b"abc");
+        wire.extend_from_slice(&3_u32.to_be_bytes());
+        wire.push(b'd');
+        let budget = MemoryBudget::new(6);
+        assert_eq!(
+            read_chunk_stream(&mut Cursor::new(wire), 6, 3, &budget).unwrap_err(),
+            SubmissionError::Io(io::ErrorKind::UnexpectedEof)
+        );
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn chunk_stream_budget_exhaustion_is_temporary_and_unambiguous() {
+        let budget = MemoryBudget::new(2);
+        let error =
+            read_chunk_stream(&mut Cursor::new(chunk_wire(&[b"abc"])), 3, 3, &budget).unwrap_err();
+        assert_eq!(
+            error,
+            SubmissionError::BudgetExhausted {
+                requested: 3,
+                capacity: 2
+            }
+        );
+        assert!(error.is_temporary());
+        assert!(!error.is_ambiguous());
+    }
+
+    #[test]
+    fn malformed_chunk_stream_is_unambiguous() {
+        let budget = MemoryBudget::new(8);
+        let error = read_chunk_stream(&mut Cursor::new([0_u8; 2]), 8, 4, &budget).unwrap_err();
+        assert!(!error.is_ambiguous());
+        assert!(!error.is_temporary());
+    }
+
+    #[test]
+    fn oversized_chunk_stream_is_unambiguous() {
+        let budget = MemoryBudget::new(8);
+        let error =
+            read_chunk_stream(&mut Cursor::new(5_u32.to_be_bytes()), 8, 4, &budget).unwrap_err();
+        assert!(!error.is_ambiguous());
+        assert!(!error.is_temporary());
     }
 }
