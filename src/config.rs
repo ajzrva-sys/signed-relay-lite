@@ -95,7 +95,7 @@ pub struct RuntimeConfig {
     pub require_fips: bool,
 }
 
-const REQUIRED_SETTINGS: [&str; 16] = [
+const REQUIRED_SETTINGS: [&str; 17] = [
     "domain",
     "selector",
     "private_key",
@@ -112,6 +112,7 @@ const REQUIRED_SETTINGS: [&str; 16] = [
     "max_concurrent_submissions",
     "submission_timeout_seconds",
     "delivery_timeout_seconds",
+    "require_fips",
 ];
 
 impl RuntimeConfig {
@@ -119,11 +120,7 @@ impl RuntimeConfig {
         let input = fs::read_to_string(path)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         let mut values = HashMap::new();
-        let allowed: HashSet<&str> = REQUIRED_SETTINGS
-            .iter()
-            .copied()
-            .chain(std::iter::once("require_fips"))
-            .collect();
+        let allowed: HashSet<&str> = REQUIRED_SETTINGS.iter().copied().collect();
 
         for (index, raw_line) in input.lines().enumerate() {
             let line = raw_line.trim();
@@ -399,100 +396,154 @@ fn openssl_fips_enabled() -> bool {
 mod tests {
     use super::*;
     use openssl::rsa::Rsa;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::sync::OnceLock;
+    use std::time::Duration;
 
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+    static RSA_PEM: OnceLock<Vec<u8>> = OnceLock::new();
 
-    struct Fixture {
+    struct ConfigFixture {
         directory: PathBuf,
         config: PathBuf,
         key: PathBuf,
         password: PathBuf,
+        fields: BTreeMap<&'static str, String>,
     }
 
-    impl Fixture {
+    impl ConfigFixture {
         fn new() -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
             let directory = std::env::temp_dir().join(format!(
-                "signed-relay-lite-config-{}-{nonce}-{}",
+                "signed-relay-lite-config-{}-{}",
                 std::process::id(),
                 FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&directory).unwrap();
             let key = directory.join("key.pem");
-            fs::write(
-                &key,
-                Rsa::generate(2048).unwrap().private_key_to_pem().unwrap(),
-            )
-            .unwrap();
+            let pem =
+                RSA_PEM.get_or_init(|| Rsa::generate(2048).unwrap().private_key_to_pem().unwrap());
+            fs::write(&key, pem).unwrap();
             let password = directory.join("password");
             fs::write(&password, b"s3cret").unwrap();
             let config = directory.join("relay.conf");
+            let fields = BTreeMap::from([
+                ("domain", "Example.COM.".to_owned()),
+                ("selector", "Mail2026".to_owned()),
+                ("private_key", key.display().to_string()),
+                (
+                    "listen",
+                    "unix:/run/signed-relay-lite/submit.sock".to_owned(),
+                ),
+                ("relay_host", "SMTP.Example.NET.".to_owned()),
+                ("relay_port", "465".to_owned()),
+                ("relay_tls", "implicit".to_owned()),
+                ("relay_username", "alice".to_owned()),
+                ("relay_password_file", password.display().to_string()),
+                ("client_name", "Mailer.Example.COM.".to_owned()),
+                ("relay_workers", "4".to_owned()),
+                ("max_message_bytes", "26214400".to_owned()),
+                ("global_message_memory_bytes", "134217728".to_owned()),
+                ("max_concurrent_submissions", "16".to_owned()),
+                ("submission_timeout_seconds", "60".to_owned()),
+                ("delivery_timeout_seconds", "120".to_owned()),
+                ("require_fips", "true".to_owned()),
+            ]);
             Self {
                 directory,
                 config,
                 key,
                 password,
+                fields,
             }
         }
 
-        fn valid(&self) -> String {
-            format!(
-                "domain=Example.COM.\nselector=Mail2026\nprivate_key={}\nlisten=unix:/run/signed-relay-lite/submit.sock\nrelay_host=SMTP.Example.NET.\nrelay_port=465\nrelay_tls=implicit\nrelay_username=alice\nrelay_password_file={}\nclient_name=Mailer.Example.COM.\nrelay_workers=4\nmax_message_bytes=26214400\nglobal_message_memory_bytes=134217728\nmax_concurrent_submissions=16\nsubmission_timeout_seconds=60\ndelivery_timeout_seconds=120\nrequire_fips=true\n",
-                self.key.display(),
-                self.password.display()
-            )
+        fn set(&mut self, key: &'static str, value: impl Into<String>) {
+            self.fields.insert(key, value.into());
         }
 
-        fn load(&self, input: &str) -> Result<RuntimeConfig, String> {
-            fs::write(&self.config, input).unwrap();
+        fn remove(&mut self, key: &'static str) {
+            self.fields.remove(key);
+        }
+
+        fn render(&self) -> String {
+            self.fields
+                .iter()
+                .map(|(name, value)| format!("{name}={value}\n"))
+                .collect()
+        }
+
+        fn load(&self) -> Result<RuntimeConfig, String> {
+            fs::write(&self.config, self.render()).unwrap();
             RuntimeConfig::load(&self.config)
         }
-    }
 
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.directory).unwrap();
+        fn load_error(&self) -> String {
+            self.load()
+                .err()
+                .expect("configuration unexpectedly loaded")
         }
     }
 
-    fn replace(input: &str, old: &str, new: &str) -> String {
-        let output = input.replacen(old, new, 1);
-        assert_ne!(output, input);
-        output
+    impl Drop for ConfigFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
     }
 
     #[test]
-    fn loads_every_required_setting_and_secrets_once() {
-        let fixture = Fixture::new();
-        let config = fixture.load(&fixture.valid()).unwrap();
+    fn normalizes_configured_dns_names() {
+        let fixture = ConfigFixture::new();
+        let config = fixture.load().unwrap();
         assert_eq!(config.signing.domain, "example.com");
         assert_eq!(config.signing.selector, "mail2026");
+        assert_eq!(config.relay_host, "smtp.example.net");
+        assert_eq!(config.client_name, "mailer.example.com");
+    }
+
+    #[test]
+    fn loads_socket_and_relay_transport() {
+        let fixture = ConfigFixture::new();
+        let config = fixture.load().unwrap();
         assert_eq!(
             config.listen,
             PathBuf::from("/run/signed-relay-lite/submit.sock")
         );
-        assert_eq!(config.relay_host, "smtp.example.net");
         assert_eq!(config.relay_port, 465);
         assert_eq!(config.relay_tls, RelayTls::Implicit);
-        assert_eq!(config.relay_username.as_deref(), Some("alice"));
-        assert_eq!(
-            config.relay_password.as_ref().unwrap().as_bytes(),
-            b"s3cret"
-        );
-        assert_eq!(config.client_name, "mailer.example.com");
+    }
+
+    #[test]
+    fn loads_numeric_resource_limits() {
+        let fixture = ConfigFixture::new();
+        let config = fixture.load().unwrap();
         assert_eq!(config.relay_workers, 4);
         assert_eq!(config.max_message_bytes, 26_214_400);
         assert_eq!(config.global_message_memory_bytes, 134_217_728);
         assert_eq!(config.max_concurrent_submissions, 16);
+    }
+
+    #[test]
+    fn loads_submission_and_delivery_timeouts() {
+        let fixture = ConfigFixture::new();
+        let config = fixture.load().unwrap();
         assert_eq!(config.submission_timeout, Duration::from_secs(60));
         assert_eq!(config.delivery_timeout, Duration::from_secs(120));
-        assert!(config.require_fips);
+    }
+
+    #[test]
+    fn loads_authentication_pair() {
+        let fixture = ConfigFixture::new();
+        let config = fixture.load().unwrap();
+        assert_eq!(config.relay_username.as_deref(), Some("alice"));
+        assert_eq!(config.relay_password.unwrap().as_bytes(), b"s3cret");
+    }
+
+    #[test]
+    fn loaded_key_and_password_outlive_source_files() {
+        let fixture = ConfigFixture::new();
+        let config = fixture.load().unwrap();
         fs::remove_file(&fixture.key).unwrap();
         fs::remove_file(&fixture.password).unwrap();
         assert!(config.signing.key.rsa().is_ok());
@@ -500,150 +551,192 @@ mod tests {
     }
 
     #[test]
+    fn loads_required_fips_flag() {
+        let mut fixture = ConfigFixture::new();
+        fixture.set("require_fips", "false");
+        assert!(!fixture.load().unwrap().require_fips);
+    }
+
+    #[test]
     fn empty_credential_settings_mean_absent() {
-        let fixture = Fixture::new();
-        let input = replace(
-            &replace(&fixture.valid(), "relay_username=alice", "relay_username="),
-            &format!("relay_password_file={}", fixture.password.display()),
-            "relay_password_file=",
-        );
-        let config = fixture.load(&input).unwrap();
+        let mut fixture = ConfigFixture::new();
+        fixture.set("relay_username", "");
+        fixture.set("relay_password_file", "");
+        let config = fixture.load().unwrap();
         assert!(config.relay_username.is_none());
         assert!(config.relay_password.is_none());
     }
 
     #[test]
-    fn rejects_unknown_duplicate_missing_and_malformed_lines() {
-        let fixture = Fixture::new();
-        let valid = fixture.valid();
-        assert!(fixture.load(&(valid.clone() + "mystery=yes\n")).is_err());
-        assert!(fixture
-            .load(&(valid.clone() + "domain=other.example\n"))
-            .is_err());
-        for name in REQUIRED_SETTINGS
-            .iter()
-            .copied()
-            .chain(std::iter::once("require_fips"))
-        {
-            let prefix = format!("{name}=");
-            let input = valid
-                .lines()
-                .filter(|line| !line.starts_with(&prefix))
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(fixture.load(&input).is_err(), "accepted missing {name}");
-        }
-        assert!(fixture.load(&(valid + "not-an-assignment\n")).is_err());
+    fn rejects_unknown_setting() {
+        let fixture = ConfigFixture::new();
+        let input = fixture.render() + "mystery=yes\n";
+        fs::write(&fixture.config, input).unwrap();
+        assert_eq!(
+            RuntimeConfig::load(&fixture.config).err().unwrap(),
+            "line 18: unknown setting mystery"
+        );
     }
 
     #[test]
-    fn rejects_bad_paths_names_tls_and_credential_pairing() {
-        let fixture = Fixture::new();
-        let valid = fixture.valid();
-        for input in [
-            replace(
-                &valid,
-                &format!("private_key={}", fixture.key.display()),
-                "private_key=key.pem",
+    fn rejects_duplicate_setting() {
+        let fixture = ConfigFixture::new();
+        let input = fixture.render() + "domain=other.example\n";
+        fs::write(&fixture.config, input).unwrap();
+        assert_eq!(
+            RuntimeConfig::load(&fixture.config).err().unwrap(),
+            "line 18: duplicate setting domain"
+        );
+    }
+
+    #[test]
+    fn rejects_each_missing_required_setting() {
+        for name in REQUIRED_SETTINGS {
+            let mut fixture = ConfigFixture::new();
+            fixture.remove(name);
+            assert_eq!(fixture.load_error(), format!("missing {name}"));
+        }
+    }
+
+    #[test]
+    fn rejects_non_assignment_line() {
+        let fixture = ConfigFixture::new();
+        let input = fixture.render() + "not-an-assignment\n";
+        fs::write(&fixture.config, input).unwrap();
+        assert_eq!(
+            RuntimeConfig::load(&fixture.config).err().unwrap(),
+            "line 18: expected name=value"
+        );
+    }
+
+    #[test]
+    fn rejects_relative_secret_paths() {
+        for (name, value, expected) in [
+            (
+                "private_key",
+                "key.pem",
+                "private_key must be an absolute path",
             ),
-            replace(
-                &valid,
-                &format!("relay_password_file={}", fixture.password.display()),
-                "relay_password_file=password",
-            ),
-            replace(
-                &valid,
-                "listen=unix:/run/signed-relay-lite/submit.sock",
-                "listen=unix:submit.sock",
-            ),
-            replace(&valid, "domain=Example.COM.", "domain=-bad.example"),
-            replace(&valid, "selector=Mail2026", "selector=bad_label"),
-            replace(
-                &valid,
-                "relay_host=SMTP.Example.NET.",
-                "relay_host=bad..example",
-            ),
-            replace(
-                &valid,
-                "client_name=Mailer.Example.COM.",
-                "client_name=bad name",
-            ),
-            replace(&valid, "relay_tls=implicit", "relay_tls=starttls"),
-            replace(&valid, "relay_username=alice", "relay_username="),
-            replace(
-                &valid,
-                &format!("relay_password_file={}", fixture.password.display()),
-                "relay_password_file=",
+            (
+                "relay_password_file",
+                "password",
+                "relay_password_file must be an absolute path",
             ),
         ] {
-            assert!(
-                fixture.load(&input).is_err(),
-                "accepted invalid config:\n{input}"
+            let mut fixture = ConfigFixture::new();
+            fixture.set(name, value);
+            assert_eq!(fixture.load_error(), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_relative_socket_path() {
+        let mut fixture = ConfigFixture::new();
+        fixture.set("listen", "unix:submit.sock");
+        assert_eq!(
+            fixture.load_error(),
+            "unix listen path must be an absolute path"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_dns_fields() {
+        for (name, value) in [
+            ("domain", "-bad.example"),
+            ("selector", "bad_label"),
+            ("relay_host", "bad..example"),
+            ("client_name", "bad name"),
+        ] {
+            let mut fixture = ConfigFixture::new();
+            fixture.set(name, value);
+            assert_eq!(fixture.load_error(), format!("invalid {name}: {value}"));
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_tls_mode() {
+        let mut fixture = ConfigFixture::new();
+        fixture.set("relay_tls", "starttls");
+        assert_eq!(fixture.load_error(), "relay_tls must be implicit");
+    }
+
+    #[test]
+    fn requires_complete_authentication_pair() {
+        for name in ["relay_username", "relay_password_file"] {
+            let mut fixture = ConfigFixture::new();
+            fixture.set(name, "");
+            assert_eq!(
+                fixture.load_error(),
+                "relay_username and relay_password_file must both be set or both be empty"
             );
         }
     }
 
     #[test]
-    fn rejects_zero_and_malformed_numbers_and_invalid_relationships() {
-        let fixture = Fixture::new();
-        let valid = fixture.valid();
-        for (old, new) in [
-            ("relay_port=465", "relay_port=0"),
-            ("relay_port=465", "relay_port=nope"),
-            ("relay_workers=4", "relay_workers=0"),
-            ("relay_workers=4", "relay_workers=nope"),
-            ("max_message_bytes=26214400", "max_message_bytes=0"),
-            ("max_message_bytes=26214400", "max_message_bytes=nope"),
-            (
-                "global_message_memory_bytes=134217728",
-                "global_message_memory_bytes=0",
-            ),
-            (
-                "global_message_memory_bytes=134217728",
-                "global_message_memory_bytes=nope",
-            ),
-            (
-                "max_concurrent_submissions=16",
-                "max_concurrent_submissions=0",
-            ),
-            (
-                "max_concurrent_submissions=16",
-                "max_concurrent_submissions=nope",
-            ),
-            (
-                "submission_timeout_seconds=60",
-                "submission_timeout_seconds=0",
-            ),
-            (
-                "submission_timeout_seconds=60",
-                "submission_timeout_seconds=nope",
-            ),
-            ("delivery_timeout_seconds=120", "delivery_timeout_seconds=0"),
-            (
-                "delivery_timeout_seconds=120",
-                "delivery_timeout_seconds=nope",
-            ),
-            ("relay_workers=4", "relay_workers=17"),
-            (
-                "global_message_memory_bytes=134217728",
-                "global_message_memory_bytes=100",
-            ),
+    fn rejects_zero_numeric_settings() {
+        for name in [
+            "relay_port",
+            "relay_workers",
+            "max_message_bytes",
+            "global_message_memory_bytes",
+            "max_concurrent_submissions",
+            "submission_timeout_seconds",
+            "delivery_timeout_seconds",
         ] {
-            let input = replace(&valid, old, new);
-            assert!(fixture.load(&input).is_err(), "accepted {new}");
+            let mut fixture = ConfigFixture::new();
+            fixture.set(name, "0");
+            assert_eq!(
+                fixture.load_error(),
+                format!("{name} must be greater than zero")
+            );
         }
     }
 
     #[test]
+    fn rejects_malformed_numeric_settings() {
+        for name in [
+            "relay_port",
+            "relay_workers",
+            "max_message_bytes",
+            "global_message_memory_bytes",
+            "max_concurrent_submissions",
+            "submission_timeout_seconds",
+            "delivery_timeout_seconds",
+        ] {
+            let mut fixture = ConfigFixture::new();
+            fixture.set(name, "nope");
+            assert_eq!(
+                fixture.load_error(),
+                format!("{name} must be a positive integer")
+            );
+        }
+    }
+
+    #[test]
+    fn requires_worker_count_within_submission_count() {
+        let mut fixture = ConfigFixture::new();
+        fixture.set("relay_workers", "17");
+        assert_eq!(
+            fixture.load_error(),
+            "relay_workers must not exceed max_concurrent_submissions"
+        );
+    }
+
+    #[test]
+    fn requires_global_budget_at_least_one_message() {
+        let mut fixture = ConfigFixture::new();
+        fixture.set("global_message_memory_bytes", "100");
+        assert_eq!(
+            fixture.load_error(),
+            "global_message_memory_bytes must be at least max_message_bytes"
+        );
+    }
+
+    #[test]
     fn requires_strict_boolean() {
-        let fixture = Fixture::new();
-        assert!(fixture
-            .load(&replace(
-                &fixture.valid(),
-                "require_fips=true",
-                "require_fips=yes"
-            ))
-            .is_err());
+        let mut fixture = ConfigFixture::new();
+        fixture.set("require_fips", "yes");
+        assert_eq!(fixture.load_error(), "require_fips must be true or false");
     }
 
     #[test]
