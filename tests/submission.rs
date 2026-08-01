@@ -84,6 +84,17 @@ fn request(message: &[u8]) -> Vec<u8> {
     bytes
 }
 
+#[test]
+fn client_stops_before_transmitting_bytes_above_server_limit() {
+    let frame = request(&[b'x'; 65]);
+    let body_offset = frame.len() - 65;
+    assert_eq!(
+        frame.len(),
+        body_offset + 64,
+        "the SRL2 client must stop before sending normalized byte limit + 1"
+    );
+}
+
 fn start_server(
     path: &Path,
     timeout: Duration,

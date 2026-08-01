@@ -56,6 +56,18 @@ fn request_frame(recipients: usize, message_len: u64, body: &[u8]) -> Vec<u8> {
     out
 }
 
+#[test]
+fn server_rejects_cumulative_chunk_length_above_advertised_limit() {
+    let mut bytes = request_frame(1, 64, &[b'x'; 64]);
+    bytes.push(b'x');
+    let mut reader = Cursor::new(bytes);
+    let result = read_request(&mut reader, &limits(), &MemoryBudget::new(64));
+    assert_eq!(
+        result.unwrap_err(),
+        SubmissionError::MessageTooLarge { len: 65, limit: 64 }
+    );
+}
+
 struct CountingReader {
     bytes: Cursor<Vec<u8>>,
     read: usize,

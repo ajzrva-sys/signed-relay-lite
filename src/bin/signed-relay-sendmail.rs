@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use signed_relay_lite::message::WireNormalizer;
-use signed_relay_lite::relay::{DeliveryStatus, Envelope};
+use signed_relay_lite::relay::{DeliveryResult, DeliveryStatus, Envelope};
 use signed_relay_lite::submission::{read_response, SubmissionError, SubmissionLimits};
 
 const EX_OK: i32 = 0;
@@ -45,12 +45,6 @@ fn run() -> i32 {
         return local_error(EX_USAGE, "submission socket path must be absolute");
     }
 
-    let message = match read_message() {
-        Ok(message) => message,
-        Err(InputError::TooLarge) => return local_error(EX_USAGE, "message is too large"),
-        Err(InputError::Io) => return local_error(EX_TEMPFAIL, "could not read message input"),
-    };
-
     let mut stream = match UnixStream::connect(&socket_path) {
         Ok(stream) => stream,
         Err(_) => return local_error(EX_TEMPFAIL, "could not connect to submission service"),
@@ -60,25 +54,23 @@ fn run() -> i32 {
     {
         return local_error(EX_TEMPFAIL, "could not configure submission connection");
     }
-    if write_request(&mut stream, &envelope, &message).is_err()
-        || stream.flush().is_err()
-        || stream.shutdown(Shutdown::Write).is_err()
-    {
-        return local_error(EX_TEMPFAIL, "could not submit message");
-    }
-
-    let limits = SubmissionLimits {
-        max_recipients: 100,
-        max_address_bytes: 254,
-        max_message_bytes: MAX_MESSAGE_BYTES as u64,
-        max_diagnostic_bytes: 4096,
-    };
-    let result = match read_response(&mut stream, &limits) {
+    let result = match submit_message(&mut io::stdin().lock(), &mut stream, &envelope, |stream| {
+        stream.shutdown(Shutdown::Write)
+    }) {
         Ok(result) => result,
-        Err(SubmissionError::Io(_)) => {
+        Err(ClientError::Input(InputError::TooLarge)) => {
+            return local_error(EX_USAGE, "message is too large")
+        }
+        Err(ClientError::Input(InputError::Io)) => {
+            return local_error(EX_TEMPFAIL, "could not read message input")
+        }
+        Err(ClientError::Write) => return local_error(EX_TEMPFAIL, "could not submit message"),
+        Err(ClientError::Response(SubmissionError::Io(_))) => {
             return local_error(EX_TEMPFAIL, "submission result was incomplete")
         }
-        Err(_) => return local_error(EX_USAGE, "invalid submission response"),
+        Err(ClientError::Response(_)) => {
+            return local_error(EX_USAGE, "invalid submission response")
+        }
     };
 
     if !result.diagnostic.is_empty() {
@@ -128,14 +120,21 @@ fn parse_arguments(
     Ok((sender, recipients))
 }
 
+#[derive(Debug)]
 enum InputError {
     TooLarge,
     Io,
 }
 
-fn read_message() -> Result<Vec<u8>, InputError> {
+#[derive(Debug)]
+enum ClientError {
+    Input(InputError),
+    Write,
+    Response(SubmissionError),
+}
+
+fn read_message(input: &mut impl Read) -> Result<Vec<u8>, InputError> {
     let mut normalizer = WireNormalizer::new(MAX_MESSAGE_BYTES);
-    let mut input = io::stdin().lock();
     let mut chunk = [0_u8; 8192];
     loop {
         let read = input.read(&mut chunk).map_err(|_| InputError::Io)?;
@@ -149,7 +148,27 @@ fn read_message() -> Result<Vec<u8>, InputError> {
     normalizer.finish().map_err(|_| InputError::TooLarge)
 }
 
-fn write_request(stream: &mut UnixStream, envelope: &Envelope, message: &[u8]) -> io::Result<()> {
+fn submit_message<R: Read, S: Read + Write>(
+    input: &mut R,
+    stream: &mut S,
+    envelope: &Envelope,
+    shutdown_write: impl FnOnce(&mut S) -> io::Result<()>,
+) -> Result<DeliveryResult, ClientError> {
+    let message = read_message(input).map_err(ClientError::Input)?;
+    write_request(stream, envelope, &message).map_err(|_| ClientError::Write)?;
+    stream.flush().map_err(|_| ClientError::Write)?;
+    shutdown_write(stream).map_err(|_| ClientError::Write)?;
+
+    let limits = SubmissionLimits {
+        max_recipients: 100,
+        max_address_bytes: 254,
+        max_message_bytes: MAX_MESSAGE_BYTES as u64,
+        max_diagnostic_bytes: 4096,
+    };
+    read_response(stream, &limits).map_err(ClientError::Response)
+}
+
+fn write_request(stream: &mut impl Write, envelope: &Envelope, message: &[u8]) -> io::Result<()> {
     stream.write_all(b"SRL1")?;
     stream.write_all(&0_u32.to_be_bytes())?;
     write_bytes(stream, envelope.sender())?;
@@ -161,7 +180,7 @@ fn write_request(stream: &mut UnixStream, envelope: &Envelope, message: &[u8]) -
     stream.write_all(message)
 }
 
-fn write_bytes(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
+fn write_bytes(stream: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
     stream.write_all(bytes)
 }
@@ -169,4 +188,117 @@ fn write_bytes(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
 fn local_error(code: i32, context: &str) -> i32 {
     eprintln!("signed-relay-sendmail: {context}");
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::io::Cursor;
+    use std::rc::Rc;
+
+    use signed_relay_lite::submission::write_response;
+
+    struct CountingGeneratedReader {
+        remaining: usize,
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl CountingGeneratedReader {
+        fn new(len: usize, reads: Rc<Cell<usize>>) -> Self {
+            Self {
+                remaining: len,
+                reads,
+            }
+        }
+    }
+
+    impl Read for CountingGeneratedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads.set(self.reads.get() + 1);
+            let count = self.remaining.min(buffer.len());
+            buffer[..count].fill(b'a');
+            self.remaining -= count;
+            Ok(count)
+        }
+    }
+
+    struct FakeDuplex {
+        response: Cursor<Vec<u8>>,
+        request: Vec<u8>,
+        input_reads: Rc<Cell<usize>>,
+        response_reads: usize,
+    }
+
+    impl FakeDuplex {
+        fn delivering(input_reads: Rc<Cell<usize>>) -> Self {
+            let mut response = Vec::new();
+            write_response(
+                &mut response,
+                &DeliveryResult::delivered("", Some(250)),
+                4096,
+            )
+            .unwrap();
+            Self {
+                response: Cursor::new(response),
+                request: Vec::new(),
+                input_reads,
+                response_reads: 0,
+            }
+        }
+    }
+
+    impl Read for FakeDuplex {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.response_reads == 0 {
+                assert_eq!(
+                    self.input_reads.get(),
+                    0,
+                    "stdin must remain unread until the first server reply"
+                );
+            }
+            self.response_reads += 1;
+            self.response.read(buffer)
+        }
+    }
+
+    impl Write for FakeDuplex {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.request.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn envelope() -> Envelope {
+        Envelope::new(
+            b"sender@example.test",
+            vec![b"recipient@example.test".to_vec()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn client_waits_for_server_limit_before_reading_message() {
+        let reads = Rc::new(Cell::new(0));
+        let mut input = CountingGeneratedReader::new(1, Rc::clone(&reads));
+        let mut peer = FakeDuplex::delivering(Rc::clone(&reads));
+        submit_message(&mut input, &mut peer, &envelope(), |_| Ok(())).unwrap();
+        assert!(reads.get() > 0, "stdin must be consumed after READY");
+    }
+
+    #[test]
+    fn client_accepts_a_stream_larger_than_the_removed_25_mib_constant_when_server_allows_it() {
+        let reads = Rc::new(Cell::new(0));
+        let mut input = CountingGeneratedReader::new(MAX_MESSAGE_BYTES + 1, Rc::clone(&reads));
+        let mut peer = FakeDuplex::delivering(reads);
+        let result = submit_message(&mut input, &mut peer, &envelope(), |_| Ok(()));
+        assert!(
+            result.is_ok(),
+            "the daemon-advertised limit must be authoritative"
+        );
+    }
 }
