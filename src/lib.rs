@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod dkim;
+pub mod message;
 pub mod relay;
 
 #[cfg(test)]
