@@ -440,6 +440,21 @@ pub enum NormalizeError {
     OutputLimitExceeded,
 }
 
+/// Errors produced while normalizing directly into an output sink.
+#[derive(Debug)]
+pub enum NormalizeWriteError {
+    /// The normalized output would exceed the configured byte limit.
+    OutputLimitExceeded,
+    /// The output sink rejected a write.
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for NormalizeWriteError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 /// Streaming state machine that normalizes arbitrary line endings to CRLF.
 ///
 /// Feeds are chunk-independent: the same result is produced regardless of
@@ -448,7 +463,10 @@ pub enum NormalizeError {
 pub struct WireNormalizer {
     buf: Vec<u8>,
     limit: usize,
+    produced: usize,
     pending_cr: bool,
+    trailing: [u8; 2],
+    trailing_len: usize,
 }
 
 impl WireNormalizer {
@@ -457,7 +475,10 @@ impl WireNormalizer {
         Self {
             buf: Vec::new(),
             limit,
+            produced: 0,
             pending_cr: false,
+            trailing: [0; 2],
+            trailing_len: 0,
         }
     }
 
@@ -514,6 +535,69 @@ impl WireNormalizer {
         Ok(self.buf)
     }
 
+    /// Normalize an input chunk directly into `out` without retaining it.
+    pub fn write_to<W: std::io::Write>(
+        &mut self,
+        input: &[u8],
+        out: &mut W,
+    ) -> Result<(), NormalizeWriteError> {
+        for &byte in input {
+            match byte {
+                b'\n' if self.pending_cr => self.pending_cr = false,
+                b'\n' => {
+                    self.emit_to(b'\r', out)?;
+                    self.emit_to(b'\n', out)?;
+                }
+                b'\r' => {
+                    self.emit_to(b'\r', out)?;
+                    self.emit_to(b'\n', out)?;
+                    self.pending_cr = true;
+                }
+                other => {
+                    self.pending_cr = false;
+                    self.emit_to(other, out)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finish sink-oriented normalization with exactly one terminal CRLF.
+    pub fn finish_to<W: std::io::Write>(mut self, out: &mut W) -> Result<(), NormalizeWriteError> {
+        if self.trailing_len < 2 || self.trailing != *b"\r\n" {
+            self.emit_to(b'\r', out)?;
+            self.emit_to(b'\n', out)?;
+        }
+        Ok(())
+    }
+
+    fn emit_to<W: std::io::Write>(
+        &mut self,
+        byte: u8,
+        out: &mut W,
+    ) -> Result<(), NormalizeWriteError> {
+        let produced = self
+            .produced
+            .checked_add(1)
+            .ok_or(NormalizeWriteError::OutputLimitExceeded)?;
+        if produced > self.limit {
+            return Err(NormalizeWriteError::OutputLimitExceeded);
+        }
+        out.write_all(&[byte])?;
+        self.produced = produced;
+        if self.trailing_len == 0 {
+            self.trailing[0] = byte;
+            self.trailing_len = 1;
+        } else if self.trailing_len == 1 {
+            self.trailing[1] = byte;
+            self.trailing_len = 2;
+        } else {
+            self.trailing[0] = self.trailing[1];
+            self.trailing[1] = byte;
+        }
+        Ok(())
+    }
+
     /// Push a single byte, checking the limit with checked arithmetic.
     fn push(&mut self, b: u8) -> Result<(), NormalizeError> {
         let new_len = self
@@ -547,6 +631,51 @@ mod normalizer_tests {
 
     // Generous limit for tests that don't exercise the boundary.
     const BIG_LIMIT: usize = 1024;
+
+    fn normalize_to(chunks: &[&[u8]], limit: usize) -> Result<Vec<u8>, NormalizeWriteError> {
+        let mut output = Vec::new();
+        let mut normalizer = WireNormalizer::new(limit);
+        for chunk in chunks {
+            normalizer.write_to(chunk, &mut output)?;
+        }
+        normalizer.finish_to(&mut output)?;
+        Ok(output)
+    }
+
+    #[test]
+    fn sink_normalization_is_chunk_independent_and_preserves_non_utf8() {
+        let input = &[0xff, b'\r', b'\n', 0x80, b'\n'][..];
+        assert_eq!(
+            normalize_to(&[input], BIG_LIMIT).unwrap(),
+            normalize_to(&[&input[..2], &input[2..4], &input[4..]], BIG_LIMIT).unwrap()
+        );
+    }
+
+    #[test]
+    fn sink_normalization_stops_before_limit_plus_one() {
+        let mut output = Vec::new();
+        let mut normalizer = WireNormalizer::new(2);
+        let error = normalizer.write_to(b"A\n", &mut output).unwrap_err();
+        assert!(matches!(error, NormalizeWriteError::OutputLimitExceeded));
+        assert_eq!(output, b"A\r");
+    }
+
+    #[test]
+    fn sink_io_error_is_not_reported_as_a_size_error() {
+        struct Broken;
+        impl std::io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("broken sink"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = WireNormalizer::new(BIG_LIMIT)
+            .write_to(b"x", &mut Broken)
+            .unwrap_err();
+        assert!(matches!(error, NormalizeWriteError::Io(_)));
+    }
 
     /// Chunk independence: different chunk splits produce the same result.
     #[test]

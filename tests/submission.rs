@@ -15,8 +15,9 @@ use signed_relay_lite::message::Limits as MessageLimits;
 use signed_relay_lite::relay::{DeliveryResult, DeliveryStatus, RelayPool};
 use signed_relay_lite::smtp::{SmtpConnection, SmtpStream};
 use signed_relay_lite::submission::{
-    read_request, read_server_reply, MemoryBudget, ServerReply, SubmissionLimits, SubmissionServer,
-    SubmissionServerConfig,
+    read_chunk_stream, read_envelope_preamble, read_server_reply, write_server_reply, MemoryBudget,
+    Ready, ServerReply, SubmissionLimits, SubmissionServer, SubmissionServerConfig,
+    MAX_CHUNK_BYTES,
 };
 
 static NEXT_PATH: AtomicU64 = AtomicU64::new(0);
@@ -249,12 +250,8 @@ fn old_srl1_client_is_rejected_without_delivery() {
 #[test]
 fn client_stops_before_transmitting_bytes_above_server_limit() {
     let frame = request(&[b'x'; 65]);
-    let body_offset = frame.len() - 65;
-    assert_eq!(
-        frame.len(),
-        body_offset + 64,
-        "the SRL2 client must stop before sending normalized byte limit + 1"
-    );
+    let body_offset = frame.len() - 69;
+    assert_eq!(&frame[body_offset - 4..body_offset], &65_u32.to_be_bytes());
 }
 
 fn start_server(
@@ -815,12 +812,17 @@ fn sendmail_command(path: &Path, args: &[&str], stdin: &[u8]) -> Output {
 }
 
 fn response(status: u8, ambiguous: bool, diagnostic: &[u8]) -> Vec<u8> {
-    let mut frame = b"SRL1".to_vec();
-    frame.push(status);
-    frame.push(u8::from(ambiguous));
-    frame.extend_from_slice(&0_u16.to_be_bytes());
-    frame.extend_from_slice(&(diagnostic.len() as u32).to_be_bytes());
-    frame.extend_from_slice(diagnostic);
+    let diagnostic = String::from_utf8_lossy(diagnostic);
+    let mut result = match status {
+        0 => DeliveryResult::delivered(diagnostic, Some(250)),
+        1 => DeliveryResult::temporary_failure(diagnostic, None),
+        2 => DeliveryResult::permanent_failure(diagnostic, Some(550)),
+        3 => DeliveryResult::protocol_rejection(diagnostic, None),
+        _ => panic!("invalid test status"),
+    };
+    result.ambiguous = ambiguous;
+    let mut frame = Vec::new();
+    write_server_reply(&mut frame, &ServerReply::Final(result)).unwrap();
     frame
 }
 
@@ -874,14 +876,23 @@ fn serve_one(
             stream: &mut stream,
             bytes: Vec::new(),
         };
-        let limits = SubmissionLimits {
-            max_recipients: 100,
-            max_address_bytes: 254,
-            max_message_bytes: 26_214_400,
-            max_diagnostic_bytes: 4096,
-        };
-        let request =
-            read_request(&mut recording, &limits, &MemoryBudget::new(26_214_400)).unwrap();
+        read_envelope_preamble(&mut recording).unwrap();
+        write_server_reply(
+            recording.stream,
+            &ServerReply::Ready(Ready {
+                max_message_bytes: 26_214_400,
+                max_chunk_bytes: MAX_CHUNK_BYTES as u32,
+                max_diagnostic_bytes: 4096,
+            }),
+        )
+        .unwrap();
+        let request = read_chunk_stream(
+            &mut recording,
+            26_214_400,
+            MAX_CHUNK_BYTES as u32,
+            &MemoryBudget::new(26_214_400),
+        )
+        .unwrap();
         drop(request);
         tx.send(recording.bytes).unwrap();
         stream.write_all(&reply).unwrap();
@@ -890,7 +901,7 @@ fn serve_one(
 }
 
 fn assert_request(frame: &[u8], sender: &[u8], recipients: &[&[u8]], message: &[u8]) {
-    let mut expected = b"SRL1".to_vec();
+    let mut expected = b"SRL2".to_vec();
     expected.extend_from_slice(&0_u32.to_be_bytes());
     expected.extend_from_slice(&(sender.len() as u32).to_be_bytes());
     expected.extend_from_slice(sender);
@@ -899,8 +910,9 @@ fn assert_request(frame: &[u8], sender: &[u8], recipients: &[&[u8]], message: &[
         expected.extend_from_slice(&(recipient.len() as u32).to_be_bytes());
         expected.extend_from_slice(recipient);
     }
-    expected.extend_from_slice(&(message.len() as u64).to_be_bytes());
+    expected.extend_from_slice(&(message.len() as u32).to_be_bytes());
     expected.extend_from_slice(message);
+    expected.extend_from_slice(&0_u32.to_be_bytes());
     assert_eq!(frame, expected);
 }
 
@@ -1025,7 +1037,7 @@ fn sendmail_connection_failure_and_relative_socket_are_classified() {
         &["-f", "a@example.com", "b@example.net"],
         b"X: y\n\n",
     );
-    assert_eq!(output.status.code(), Some(75));
+    assert_eq!(output.status.code(), Some(74));
     assert!(!output
         .stderr
         .windows(b"credential-sentinel-7f21".len())
