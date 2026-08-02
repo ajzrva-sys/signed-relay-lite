@@ -799,6 +799,7 @@ fn sendmail_command(path: &Path, args: &[&str], stdin: &[u8]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_signed-relay-sendmail"))
         .args(args)
         .env("SIGNED_RELAY_SOCKET", path)
+        // Environment-leak canary: this is not a supported client setting.
         .env("SIGNED_RELAY_CREDENTIAL", "credential-sentinel-7f21")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

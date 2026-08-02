@@ -301,6 +301,4 @@ mod tests {
         assert_eq!(results.iter().map(|(_, bytes)| *bytes).sum::<usize>(), 60);
         assert_eq!(budget.used(), 0);
     }
-
-    // ── Budget integration into read_request ─────────────────────────
 }

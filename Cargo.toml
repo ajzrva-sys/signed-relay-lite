@@ -10,6 +10,7 @@ repository = "https://github.com/ajzrva-sys/signed-relay-lite"
 homepage = "https://github.com/ajzrva-sys/signed-relay-lite"
 keywords = ["dkim", "smtp", "email", "relay"]
 categories = ["email"]
+exclude = [".hermes/**", "HANDOFF.md"]
 
 [dependencies]
 libc = "=0.2.177"

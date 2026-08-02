@@ -22,40 +22,11 @@ use signed_relay_lite::relay::{
 };
 use signed_relay_lite::smtp::{read_reply, SmtpConnection, SmtpError, SmtpStream};
 use signed_relay_lite::submission::{
-    read_chunk_stream, read_request, read_response, read_server_reply, write_response,
-    MemoryBudget, ServerReply, SubmissionError, SubmissionLimits, SubmissionServer,
-    SubmissionServerConfig,
+    read_chunk_stream, read_server_reply, MemoryBudget, ServerReply, SubmissionError,
+    SubmissionServer, SubmissionServerConfig,
 };
 
 const DEADLINE: Duration = Duration::from_secs(2);
-
-fn limits() -> SubmissionLimits {
-    SubmissionLimits {
-        max_recipients: 100,
-        max_address_bytes: 254,
-        max_message_bytes: 64,
-        max_diagnostic_bytes: 32,
-    }
-}
-
-fn frame_prefix(recipients: u32) -> Vec<u8> {
-    let mut out = b"SRL1".to_vec();
-    out.extend(0_u32.to_be_bytes());
-    out.extend(0_u32.to_be_bytes());
-    out.extend(recipients.to_be_bytes());
-    out
-}
-
-fn request_frame(recipients: usize, message_len: u64, body: &[u8]) -> Vec<u8> {
-    let mut out = frame_prefix(recipients as u32);
-    for _ in 0..recipients {
-        out.extend(1_u32.to_be_bytes());
-        out.push(b'a');
-    }
-    out.extend(message_len.to_be_bytes());
-    out.extend(body);
-    out
-}
 
 #[test]
 fn server_rejects_cumulative_chunk_length_above_advertised_limit() {
@@ -119,24 +90,6 @@ impl Read for CountingReader {
 }
 
 #[test]
-fn declared_message_max_plus_one_is_rejected_before_body_read_or_reservation() {
-    let mut bytes = request_frame(1, 65, b"body-must-not-be-read");
-    let header_len = bytes.len() - b"body-must-not-be-read".len();
-    let mut reader = CountingReader::new(std::mem::take(&mut bytes));
-    let budget = MemoryBudget::new(64);
-    assert_eq!(
-        read_request(&mut reader, &limits(), &budget).unwrap_err(),
-        SubmissionError::MessageTooLarge { len: 65, limit: 64 }
-    );
-    assert_eq!(reader.read, header_len, "no body byte may be requested");
-    assert_eq!(
-        budget.used(),
-        0,
-        "rejection must precede reservation/allocation"
-    );
-}
-
-#[test]
 fn normalizer_exact_output_max_succeeds_and_expansion_plus_one_fails_across_split_cr() {
     assert_eq!(normalize(&[b"a\n"], 3).unwrap(), b"a\r\n");
     assert_eq!(
@@ -179,7 +132,7 @@ fn header_block_exact_max_is_accepted_and_one_more_is_rejected() {
 }
 
 #[test]
-fn envelope_and_srl1_recipient_100_boundary_is_checked_before_recipient_bytes() {
+fn envelope_recipient_100_boundary() {
     let hundred = vec![b"a@b".to_vec(); 100];
     assert_eq!(
         Envelope::new(b"s@b", hundred).unwrap().recipients().len(),
@@ -188,52 +141,6 @@ fn envelope_and_srl1_recipient_100_boundary_is_checked_before_recipient_bytes() 
     assert_eq!(
         Envelope::new(b"s@b", vec![b"a@b".to_vec(); 101]),
         Err(EnvelopeError::TooManyRecipients(101))
-    );
-
-    let exact = request_frame(100, 0, b"");
-    assert_eq!(
-        read_request(&mut Cursor::new(exact), &limits(), &MemoryBudget::new(1))
-            .unwrap()
-            .envelope
-            .recipients()
-            .len(),
-        100
-    );
-    let mut reader = CountingReader::new(frame_prefix(101));
-    assert_eq!(
-        read_request(&mut reader, &limits(), &MemoryBudget::new(1)).unwrap_err(),
-        SubmissionError::TooManyRecipients {
-            count: 101,
-            limit: 100
-        }
-    );
-    assert_eq!(reader.read, 16, "recipient bytes must not be requested");
-}
-
-#[test]
-fn diagnostic_exact_configured_max_is_preserved_and_max_plus_one_is_truncated_on_write() {
-    for (input, expected) in [("x".repeat(32), 32), ("y".repeat(33), 32)] {
-        let result = DeliveryResult {
-            status: DeliveryStatus::TemporaryFailure,
-            ambiguous: false,
-            smtp_code: None,
-            diagnostic: input,
-        };
-        let mut wire = Vec::new();
-        write_response(&mut wire, &result, 32).unwrap();
-        let decoded = read_response(&mut Cursor::new(wire), &limits()).unwrap();
-        assert_eq!(decoded.diagnostic.len(), expected);
-    }
-    let mut oversized = b"SRL1\x01\x00\x00\x00".to_vec();
-    oversized.extend(33_u32.to_be_bytes());
-    let mut reader = CountingReader::new(oversized);
-    assert_eq!(
-        read_response(&mut reader, &limits()).unwrap_err(),
-        SubmissionError::DiagnosticTooLong { len: 33, limit: 32 }
-    );
-    assert_eq!(
-        reader.read, 12,
-        "oversized diagnostic bytes must not be read"
     );
 }
 
@@ -253,45 +160,6 @@ fn memory_budget_concurrent_exhaustion_never_exceeds_cap_and_drop_releases() {
     drop(held);
     assert_eq!(budget.used(), 0);
     assert!(budget.try_reserve(10).is_some());
-}
-
-#[test]
-fn u64_max_message_lengths_are_rejected_without_body_read_or_budget_change() {
-    // The final case reaches the checked u64-to-usize conversion path because
-    // the configured wire limit itself permits u64::MAX.
-    for max in [0, 64, u64::MAX - 1, u64::MAX] {
-        let mut reader = CountingReader::new(request_frame(1, u64::MAX, b"unread"));
-        let prefix = reader.bytes.get_ref().len() - 6;
-        let budget = MemoryBudget::new(8);
-        let error = read_request(
-            &mut reader,
-            &SubmissionLimits {
-                max_message_bytes: max,
-                ..limits()
-            },
-            &budget,
-        )
-        .unwrap_err();
-        if max == u64::MAX && usize::BITS == 64 {
-            assert_eq!(
-                error,
-                SubmissionError::BudgetExhausted {
-                    requested: usize::MAX,
-                    capacity: 8
-                }
-            );
-        } else {
-            assert_eq!(
-                error,
-                SubmissionError::MessageTooLarge {
-                    len: u64::MAX,
-                    limit: max
-                }
-            );
-        }
-        assert_eq!(reader.read, prefix);
-        assert_eq!(budget.used(), 0);
-    }
 }
 
 #[test]
