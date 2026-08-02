@@ -806,7 +806,13 @@ fn sendmail_command(path: &Path, args: &[&str], stdin: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    if let Err(error) = child.stdin.take().unwrap().write_all(stdin) {
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe,
+            "writing sendmail stdin failed"
+        );
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         if child.try_wait().unwrap().is_some() {
