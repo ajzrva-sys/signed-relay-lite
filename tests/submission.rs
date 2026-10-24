@@ -262,6 +262,18 @@ fn start_server(
     budget: MemoryBudget,
     relay: Arc<RelayPool>,
 ) -> Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)> {
+    start_server_with_signing(path, timeout, handlers, limits, budget, relay, signing())
+}
+
+fn start_server_with_signing(
+    path: &Path,
+    timeout: Duration,
+    handlers: usize,
+    limits: SubmissionLimits,
+    budget: MemoryBudget,
+    relay: Arc<RelayPool>,
+    signing: SigningConfig,
+) -> Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let server = match SubmissionServer::bind(
         path,
@@ -273,7 +285,7 @@ fn start_server(
         },
         MessageLimits::testing(),
         budget,
-        signing(),
+        signing,
         relay,
         Arc::clone(&shutdown),
     ) {
@@ -683,6 +695,160 @@ fn malformed_message_is_a_bounded_protocol_rejection() {
 #[test]
 fn dkim_domain_rejection_is_a_bounded_protocol_rejection() {
     assert_protocol_rejection(&request(b"From: sender@wrong.example\r\n\r\nbody\r\n"));
+}
+
+#[test]
+fn comment_address_cannot_authorize_a_different_from_domain_or_attempt_smtp() {
+    let path = TestPath::new();
+    let limits = submission_limits();
+    let smtp_attempts = Arc::new(AtomicU64::new(0));
+    let attempts = Arc::clone(&smtp_attempts);
+    let relay = Arc::new(RelayPool::new(1, 1, move || {
+        let attempts = Arc::clone(&attempts);
+        SmtpConnection::new("submission-test", move || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "SMTP must not be attempted for a rejected From",
+            ))
+        })
+    }));
+    let Some((shutdown, server)) = start_server(
+        &path.0,
+        Duration::from_secs(1),
+        1,
+        limits.clone(),
+        MemoryBudget::new(1024),
+        relay,
+    ) else {
+        return;
+    };
+    let mut client = UnixStream::connect(&path.0).unwrap();
+    client
+        .write_all(&request(
+            b"From: attacker@other.test (note <user@example.com>)\r\n\r\nbody\r\n",
+        ))
+        .unwrap();
+    let result = read_result(&mut client, &limits);
+    assert_eq!(result.status, DeliveryStatus::ProtocolRejection);
+    assert!(!result.ambiguous);
+    assert!(result.diagnostic.contains("does not match"));
+    stop_server(shutdown, server);
+    assert_eq!(smtp_attempts.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn valid_commented_and_quoted_from_addresses_are_delivered() {
+    for from in [
+        "sender@example.com (note <other@other.test>)",
+        "\"Sender <other@other.test>\" <sender@example.com>",
+        "\"sender local\"@EXAMPLE.COM.",
+    ] {
+        let path = TestPath::new();
+        let limits = submission_limits();
+        let (relay, captured, release, peer) = gated_relay(b"250 accepted\r\n");
+        let Some((shutdown, server)) = start_server(
+            &path.0,
+            Duration::from_secs(1),
+            1,
+            limits.clone(),
+            MemoryBudget::new(1024),
+            relay,
+        ) else {
+            return;
+        };
+        let original = format!("From: {from}\r\n\r\nbody\r\n");
+        let mut client = UnixStream::connect(&path.0).unwrap();
+        client.write_all(&request(original.as_bytes())).unwrap();
+        let signed = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(signed.starts_with(b"DKIM-Signature: "), "From: {from}");
+        assert!(signed.ends_with(original.as_bytes()));
+        release.send(()).unwrap();
+        assert_eq!(
+            read_result(&mut client, &limits).status,
+            DeliveryStatus::Delivered,
+            "From: {from}"
+        );
+        stop_server(shutdown, server);
+        peer.join().unwrap();
+    }
+}
+
+#[test]
+fn submitted_reply_subjects_and_empty_bodies_have_independently_valid_signatures() {
+    const EMPTY_HASH: &str = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+    const HELLO_HASH: &str = "zS7KNTV0HyeorkDDGwxB1AV6enuRKzO5rthkhdHIRnY=";
+    for (subject, body, expected_body_hash) in [
+        ("Re: hello", "hello\r\n", HELLO_HASH),
+        ("Re:\r\n\t hello", "hello\r\n", HELLO_HASH),
+        ("Re: hello", "", EMPTY_HASH),
+        ("Re: hello", "\r\n\r\n", EMPTY_HASH),
+        ("Re: hello", " \t\r\n\t \r\n", EMPTY_HASH),
+    ] {
+        let path = TestPath::new();
+        let limits = submission_limits();
+        let signing = signing();
+        let key = Arc::clone(&signing.key);
+        let (relay, captured, release, peer) = gated_relay(b"250 verified\r\n");
+        let Some((shutdown, server)) = start_server_with_signing(
+            &path.0,
+            Duration::from_secs(1),
+            1,
+            limits.clone(),
+            MemoryBudget::new(1024),
+            relay,
+            signing,
+        ) else {
+            return;
+        };
+        let original = format!("From: sender@example.com\r\nSubject: {subject}\r\n\r\n{body}");
+        let mut client = UnixStream::connect(&path.0).unwrap();
+        client.write_all(&request(original.as_bytes())).unwrap();
+        let signed = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(signed.ends_with(original.as_bytes()));
+        let signature_header =
+            std::str::from_utf8(&signed[..signed.len() - original.len()]).unwrap();
+        let unfolded = signature_header
+            .strip_prefix("DKIM-Signature: ")
+            .unwrap()
+            .strip_suffix("\r\n")
+            .unwrap()
+            .replace("\r\n\t", " ");
+        let tag = |name: &str| {
+            unfolded
+                .split(';')
+                .filter_map(|part| part.trim().split_once('='))
+                .find_map(|(key, value)| (key == name).then_some(value))
+                .unwrap()
+        };
+        assert_eq!(tag("bh"), expected_body_hash);
+        assert_eq!(tag("h"), "from:from:subject");
+        let timestamp: u64 = tag("t").parse().unwrap();
+        let signature = openssl::base64::decode_block(tag("b")).unwrap();
+        // These are literal RFC 6376 relaxed bytes, independent of the signing
+        // implementation and the submitted subject's folding.
+        let unsigned_signature = format!(
+            "dkim-signature:v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=test; t={timestamp}; h=from:from:subject; bh={expected_body_hash}; b="
+        );
+        let mut verifier =
+            openssl::sign::Verifier::new(openssl::hash::MessageDigest::sha256(), key.as_ref())
+                .unwrap();
+        verifier
+            .update(b"from:sender@example.com\r\nsubject:Re: hello\r\n")
+            .unwrap();
+        verifier.update(unsigned_signature.as_bytes()).unwrap();
+        assert!(
+            verifier.verify(&signature).unwrap(),
+            "subject {subject:?}, body {body:?}"
+        );
+        release.send(()).unwrap();
+        assert_eq!(
+            read_result(&mut client, &limits).status,
+            DeliveryStatus::Delivered
+        );
+        stop_server(shutdown, server);
+        peer.join().unwrap();
+    }
 }
 
 #[test]
