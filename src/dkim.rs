@@ -5,6 +5,7 @@ pub fn canonicalize_header(name: &[u8], value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(name.len() + value.len() + 3);
     out.extend(name.iter().map(u8::to_ascii_lowercase));
     out.push(b':');
+    let value_start = out.len();
     let mut pending_wsp = false;
     let mut index = 0;
     while index < value.len() {
@@ -16,7 +17,7 @@ pub fn canonicalize_header(name: &[u8], value: &[u8]) -> Vec<u8> {
             }
             b'\r' | b'\n' => pending_wsp = true,
             byte => {
-                if pending_wsp && out.last() != Some(&b':') {
+                if pending_wsp && out.len() > value_start {
                     out.push(b' ');
                 }
                 pending_wsp = false;
@@ -38,7 +39,6 @@ pub struct BodyCanonicalizer {
     pending_wsp: bool,
     pending_empty_lines: usize,
     line_has_content: bool,
-    emitted_content: bool,
     saw_cr: bool,
     /// Small buffer for batching canonicalized bytes before hashing.
     buf: Vec<u8>,
@@ -55,7 +55,6 @@ impl Default for BodyCanonicalizer {
             pending_wsp: false,
             pending_empty_lines: 0,
             line_has_content: false,
-            emitted_content: false,
             saw_cr: false,
             buf: Vec::with_capacity(FLUSH_THRESHOLD),
         }
@@ -89,7 +88,6 @@ impl BodyCanonicalizer {
                     }
                     self.emit(&[byte]);
                     self.line_has_content = true;
-                    self.emitted_content = true;
                 }
             }
         }
@@ -126,9 +124,6 @@ impl BodyCanonicalizer {
             self.end_line();
         } else if self.line_has_content {
             self.pending_wsp = false;
-            self.emit(b"\r\n");
-        }
-        if !self.emitted_content {
             self.emit(b"\r\n");
         }
         self.flush_buf();
@@ -275,43 +270,120 @@ fn canonicalize_signature_header(value: &[u8]) -> Vec<u8> {
 /// strings. Returns `None` for multiple addresses, malformed input, or
 /// unparseable domain.
 fn from_domain(value: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(value).ok()?.trim();
+    // Unfold legal header folding before validating quoted local parts.
+    let mut unfolded = Vec::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let byte = value[index];
+        if byte == b'\r' {
+            if value.get(index + 1) != Some(&b'\n')
+                || !matches!(value.get(index + 2), Some(b' ' | b'\t'))
+            {
+                return None;
+            }
+            index += 2;
+            continue;
+        }
+        if byte.is_ascii_control() && byte != b'\t' {
+            return None;
+        }
+        unfolded.push(byte);
+        index += 1;
+    }
+    // Strip comments before looking for structural punctuation. Quoted strings
+    // and quoted-pairs keep their bytes; punctuation inside them is not syntax.
+    let mut mailbox = Vec::with_capacity(value.len());
     let mut quoted = false;
     let mut escaped = false;
     let mut comment_depth = 0usize;
-    let mut angle_depth = 0usize;
-    let mut commas = 0usize;
-    for ch in text.chars() {
+    for &byte in &unfolded {
         if escaped {
+            if comment_depth == 0 {
+                mailbox.push(byte);
+            }
             escaped = false;
             continue;
         }
-        if quoted && ch == '\\' {
+        if comment_depth > 0 {
+            match byte {
+                b'\\' => escaped = true,
+                b'(' => comment_depth = comment_depth.checked_add(1)?,
+                b')' => comment_depth -= 1,
+                _ => {}
+            }
+        } else if quoted {
+            mailbox.push(byte);
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => quoted = false,
+                _ => {}
+            }
+        } else {
+            match byte {
+                b'(' => {
+                    comment_depth = 1;
+                    mailbox.push(b' ');
+                }
+                b')' => return None,
+                b'"' => {
+                    quoted = true;
+                    mailbox.push(byte);
+                }
+                _ => mailbox.push(byte),
+            }
+        }
+    }
+    if quoted || escaped || comment_depth != 0 {
+        return None;
+    }
+    let text = std::str::from_utf8(&mailbox).ok()?.trim();
+    let mut start = None;
+    let mut end = None;
+    for (index, byte) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
             escaped = true;
-        } else if comment_depth == 0 && ch == '"' {
+        } else if byte == b'"' {
             quoted = !quoted;
         } else if !quoted {
-            match ch {
-                '(' => comment_depth += 1,
-                ')' if comment_depth > 0 => comment_depth -= 1,
-                '<' if comment_depth == 0 => angle_depth += 1,
-                '>' if comment_depth == 0 && angle_depth > 0 => angle_depth -= 1,
-                ',' if comment_depth == 0 && angle_depth == 0 => commas += 1,
+            match byte {
+                b'<' if start.is_none() => start = Some(index),
+                b'>' if start.is_some() && end.is_none() => end = Some(index),
+                b'<' | b'>' | b',' | b':' | b';' => return None,
                 _ => {}
             }
         }
     }
-    if quoted || comment_depth != 0 || angle_depth != 0 || commas != 0 {
-        return None;
-    }
-    let address = match (text.rfind('<'), text.rfind('>')) {
-        (Some(start), Some(end)) if start < end => &text[start + 1..end],
+    let address = match (start, end) {
+        (Some(start), Some(end)) => {
+            // Before angle-addr only a display phrase is allowed; after it only
+            // whitespace/comments are allowed. Never discard a second address.
+            if !display_name(&text.as_bytes()[..start]) || !text[end + 1..].trim().is_empty() {
+                return None;
+            }
+            text[start + 1..end].trim()
+        }
         (None, None) => text,
         _ => return None,
     };
-    let (_, domain) = address.rsplit_once('@')?;
-    let domain = domain.trim().trim_end_matches('.');
-    if domain.is_empty()
+    let mut separator = None;
+    for (index, byte) in address.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        } else if !quoted && byte == b'@' && separator.replace(index).is_some() {
+            return None;
+        }
+    }
+    let separator = separator?;
+    let local = address[..separator].trim();
+    let domain = address[separator + 1..].trim().trim_end_matches('.');
+    if !local_part(local.as_bytes())
+        || domain.is_empty()
         || !domain
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
@@ -319,6 +391,60 @@ fn from_domain(value: &[u8]) -> Option<String> {
         return None;
     }
     Some(domain.to_ascii_lowercase())
+}
+
+fn atom_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&byte)
+}
+
+fn local_part(value: &[u8]) -> bool {
+    if value.first() == Some(&b'"') {
+        let mut escaped = false;
+        for (index, &byte) in value.iter().enumerate().skip(1) {
+            if byte.is_ascii_control() && byte != b'\t' {
+                return false;
+            }
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                return index == value.len() - 1;
+            }
+        }
+        false
+    } else {
+        !value.is_empty()
+            && value
+                .split(|&byte| byte == b'.')
+                .all(|part| !part.is_empty() && part.iter().all(|&byte| atom_byte(byte)))
+    }
+}
+
+fn display_name(value: &[u8]) -> bool {
+    let mut quoted = false;
+    let mut escaped = false;
+    for &byte in value {
+        if escaped {
+            if byte.is_ascii_control() {
+                return false;
+            }
+            escaped = false;
+        } else if quoted {
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => quoted = false,
+                _ if byte.is_ascii_control() && byte != b'\t' => return false,
+                _ => {}
+            }
+        } else if byte == b'"' {
+            quoted = true;
+        } else if !atom_byte(byte) && byte != b'.' && !byte.is_ascii_whitespace() && byte.is_ascii()
+        {
+            return false;
+        }
+    }
+    !quoted && !escaped
 }
 
 /// Fold a DKIM-Signature field value at 72-column boundaries.
@@ -367,6 +493,69 @@ mod tests {
     }
 
     #[test]
+    fn relaxed_header_preserves_whitespace_after_value_colons() {
+        assert_eq!(
+            canonicalize_header(b"Subject", b"  Re: \t hello: world  "),
+            b"subject:Re: hello: world\r\n"
+        );
+        assert_eq!(
+            canonicalize_header(b"Subject", b"Re:\r\n\t hello"),
+            b"subject:Re: hello\r\n"
+        );
+    }
+
+    #[test]
+    fn from_parser_ignores_quoted_and_commented_punctuation() {
+        for value in [
+            b"alice@EXAMPLE.COM.".as_slice(),
+            b"Alice (team) <alice@Example.COM>",
+            b"alice (team) @ example.com",
+            b"\"folded\r\n \tlocal\"@example.com",
+            b"\"display <fake@other.test>\" <alice@example.com>",
+            b"Alice (outer (nested) note <fake@other.test>) <alice@example.com>",
+            b"Alice (escaped \\) <fake@other.test>) <alice@example.com>",
+            b"\"a\\\"b@local\"@Example.COM.",
+        ] {
+            assert_eq!(
+                from_domain(value).as_deref(),
+                Some("example.com"),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            from_domain(b"attacker@other.test (note <user@example.com>)").as_deref(),
+            Some("other.test")
+        );
+    }
+
+    #[test]
+    fn from_parser_rejects_extra_mailboxes_and_unbalanced_syntax() {
+        for value in [
+            b"a@example.com, b@example.com".as_slice(),
+            b"a@example.com <b@example.com>",
+            b"<a@example.com> <b@example.com>",
+            b"<a@example.com> b@example.com",
+            b"<a@example.com,b@example.com>",
+            b"a@example.com b@example.com",
+            b"<a@example.com>>",
+            b"<<a@example.com>",
+            b"a@example.com>",
+            b"<a@example.com",
+            b"a@example.com (unfinished",
+            b"a@example.com )",
+            b"\"unfinished <a@example.com>",
+            b"\"quoted\" extra@example.com",
+            b"a@@example.com",
+            b"@example.com",
+            b"a..b@example.com",
+            b"\"bad\r\nlocal\"@example.com",
+            b"\"bad\n local\"@example.com",
+        ] {
+            assert_eq!(from_domain(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
     fn relaxed_header() {
         assert_eq!(
             canonicalize_header(b"SUBJect", b"  hello\r\n\tworld  "),
@@ -398,12 +587,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_body_is_one_crlf() {
-        let mut sha = Sha256::new();
-        sha.update(b"\r\n");
-        let expected = base64::encode_block(&sha.finish());
-        assert_eq!(body(&[]), expected);
-        assert_eq!(body(&[b"\r\n\r\n"]), expected);
+    fn relaxed_empty_body_hashes_no_bytes() {
+        // RFC 6376 section 3.4.4 gives this SHA-256 hash for an empty body.
+        const EMPTY_HASH: &str = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+        for input in [b"".as_slice(), b"\r\n\r\n", b" \t", b" \t\r\n\t\r\n"] {
+            assert_eq!(body(&[input]), EMPTY_HASH);
+            for split in 0..=input.len() {
+                assert_eq!(body(&[&input[..split], &input[split..]]), EMPTY_HASH);
+            }
+        }
     }
 
     #[test]
@@ -846,5 +1038,71 @@ mod tests {
             .unwrap();
         verifier2.update(&canonicalized_sig).unwrap();
         assert!(!verifier2.verify(&signature).unwrap());
+    }
+    #[test]
+    fn generated_signatures_verify_against_literal_rfc_inputs() {
+        let key = test_key();
+        let config = test_config(&key);
+        let subjects: &[(&[u8], &[u8])] = &[
+            (b"hello", b"subject:hello\r\n"),
+            (b"Re: hello", b"subject:Re: hello\r\n"),
+            (
+                b"  Re:\r\n\t hello: \tworld  ",
+                b"subject:Re: hello: world\r\n",
+            ),
+        ];
+        let bodies: &[(&[u8], &str)] = &[
+            (b"", "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="),
+            (b"\r\n\r\n", "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="),
+            (b" \t\r\n\t", "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="),
+            (b"hello\r\n", "zS7KNTV0HyeorkDDGwxB1AV6enuRKzO5rthkhdHIRnY="),
+        ];
+        for &(subject, expected_subject) in subjects {
+            for &(input, expected_hash) in bodies {
+                let mut canonical = BodyCanonicalizer::default();
+                for byte in input {
+                    canonical.update(std::slice::from_ref(byte));
+                }
+                let headers = [
+                    HeaderRef {
+                        name: b"From",
+                        value: b"Alice <alice@example.com>",
+                    },
+                    HeaderRef {
+                        name: b"Subject",
+                        value: subject,
+                    },
+                ];
+                let value = String::from_utf8(
+                    sign(&config, &headers, canonical.finish(), 1_722_000_000).unwrap(),
+                )
+                .unwrap();
+                let unfolded = value.replace("\r\n\t", " ");
+                assert!(unfolded.contains("h=from:from:subject;"));
+                assert!(unfolded.contains(&format!("bh={expected_hash};")));
+                let timestamp = unfolded
+                    .split(';')
+                    .find_map(|tag| tag.trim().strip_prefix("t="))
+                    .unwrap();
+                let b_start = unfolded.find("b=").unwrap() + 2;
+                let signature = base64::decode_block(&unfolded[b_start..]).unwrap();
+                // Literal expected canonical bytes, independent of all production
+                // canonicalizers. The timestamp is the only nondeterministic tag.
+                let unsigned = format!(
+                    "dkim-signature:v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=test; t={timestamp}; h=from:from:subject; bh={expected_hash}; b="
+                );
+                let mut verifier =
+                    Verifier::new(openssl::hash::MessageDigest::sha256(), &key).unwrap();
+                verifier
+                    .update(b"from:Alice <alice@example.com>\r\n")
+                    .unwrap();
+                verifier.update(expected_subject).unwrap();
+                verifier.update(unsigned.as_bytes()).unwrap();
+                assert!(
+                    verifier.verify(&signature).unwrap(),
+                    "subject={subject:?}, body={input:?}"
+                );
+            }
+        }
     }
 }
